@@ -1,6 +1,6 @@
 {
-    "python-envs.defaultEnvManager": "ms-python.python:conda",
-    "python-envs.defaultPackageManager": "ms-python.python:conda",
-    "python.analysis.typeCheckingMode": "off",
-    "basedpyright.disableLanguageServices": true
+    "python.defaultInterpreterPath": ".venv/Scripts/python.exe",
+    "python.analysis.typeCheckingMode": "basic",
+    "python.analysis.useLibraryCodeForTypes": true,
+    "python.analysis.autoImportCompletions": true
 }

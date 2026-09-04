@@ -1,7 +1,25 @@
+# Secretos
 .env
-data/*
+.env.local
+!.env.example
+
+# Datos locales (lake, caché de exploración, exports)
+data/
+*.xlsx
+*.csv
+!tests/**/*.csv
+
+# Python
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
 .venv/
+.ruff_cache/
+.pytest_cache/
+dist/
+build/
+*.egg-info/
+
+# Notebooks
+.ipynb_checkpoints/

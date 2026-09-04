@@ -1,4 +1,0 @@
-sodapy
-pandas
-numpy
-matplotlib

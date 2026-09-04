@@ -35,7 +35,19 @@ def test_year_and_value_ranges() -> None:
     assert "TRY_CAST(year AS INTEGER) >= ?" in sql
     assert "TRY_CAST(year AS INTEGER) <= ?" in sql
     assert "TRY_CAST(valor_del_contrato AS DOUBLE) >= ?" in sql
-    assert params == [2024, 2025, 1_000_000.0]
+    assert params == [2024, "unknown", 2025, "unknown", 1_000_000.0]
+
+
+def test_year_filters_never_exclude_unknown_partition() -> None:
+    """year=unknown (fecha nula o fuera de rango) debe sobrevivir el filtro de año:
+    no se puede descartar por año un contrato cuyo año no se conoce."""
+    sql, params = build_query(QuerySpec(year_from=2024))
+    assert "OR year = ?" in sql
+    assert "unknown" in params
+
+    sql, params = build_query(QuerySpec(year_from=2024, year_to=2025))
+    assert sql.count("OR year = ?") == 2
+    assert params.count("unknown") == 2
 
 
 def test_limit_adds_order_and_param() -> None:

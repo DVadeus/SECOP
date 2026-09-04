@@ -26,7 +26,8 @@ from secop.storage.base import ObjectStore
 
 logger = logging.getLogger(__name__)
 
-UNKNOWN_PARTITION = "year=unknown"
+UNKNOWN_YEAR = "unknown"
+UNKNOWN_PARTITION = f"year={UNKNOWN_YEAR}"
 _MIN_REAL_YEAR = 2000
 
 

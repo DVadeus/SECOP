@@ -10,6 +10,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
+from secop.lake import UNKNOWN_YEAR
 from secop.query.engine import VIEW_NAME
 
 _IDENTIFIER = re.compile(r"^[a-z_][a-z0-9_]*$")
@@ -80,12 +81,17 @@ def build_query(spec: QuerySpec) -> tuple[str, list[object]]:
         where.append(_in_clause_ci("estado_contrato", spec.estado, params))
     if spec.modalidad:
         where.append(_in_clause_ci("modalidad_de_contratacion", spec.modalidad, params))
+    # "year=unknown" (fecha de inicio nula o fuera de rango) siempre pasa el
+    # filtro de año: si no se conoce el año no se puede afirmar que esté fuera
+    # del rango pedido, y es importante no perder esos contratos de la búsqueda.
     if spec.year_from is not None:
-        where.append("TRY_CAST(year AS INTEGER) >= ?")
+        where.append("(TRY_CAST(year AS INTEGER) >= ? OR year = ?)")
         params.append(spec.year_from)
+        params.append(UNKNOWN_YEAR)
     if spec.year_to is not None:
-        where.append("TRY_CAST(year AS INTEGER) <= ?")
+        where.append("(TRY_CAST(year AS INTEGER) <= ? OR year = ?)")
         params.append(spec.year_to)
+        params.append(UNKNOWN_YEAR)
     if spec.valor_min is not None:
         where.append("TRY_CAST(valor_del_contrato AS DOUBLE) >= ?")
         params.append(spec.valor_min)

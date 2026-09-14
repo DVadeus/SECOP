@@ -86,6 +86,39 @@ def test_export_excel_and_csv(seeded_lake: Path, tmp_path: Path) -> None:
     assert csv.exists()
 
 
+def test_export_excel_removes_illegal_control_chars(tmp_path: Path) -> None:
+    """El origen cuela caracteres de control C0 que openpyxl rechaza."""
+    df = pd.DataFrame(
+        {
+            "tipo_de_contrato": ["Prestación de servicios\x0b", "a\x00b", "x\x1fy"],
+            "categorica": pd.Series(["A\x0c", "B", "C"], dtype="category"),
+            "ultima_actualizacion": pd.to_datetime(
+                ["2026-01-01", "2026-02-01", "2026-03-01"], utc=True
+            ),
+        }
+    )
+    written = export_dataframe(df, tmp_path / "sucio.xlsx")
+
+    out = pd.read_excel(written)
+    assert list(out["tipo_de_contrato"]) == ["Prestación de servicios", "ab", "xy"]
+    assert list(out["categorica"]) == ["A", "B", "C"]
+    assert out["ultima_actualizacion"].iloc[0] == pd.Timestamp("2026-01-01")
+
+
+def test_export_excel_preserves_tabs_and_newlines(tmp_path: Path) -> None:
+    """\\t, \\n y \\r sí son válidos en una celda: no deben tocarse."""
+    df = pd.DataFrame({"objeto": ["línea1\nlínea2\tfin"]})
+    out = pd.read_excel(export_dataframe(df, tmp_path / "limpio.xlsx"))
+    assert out["objeto"].iloc[0] == "línea1\nlínea2\tfin"
+
+
+def test_export_csv_keeps_raw_text(tmp_path: Path) -> None:
+    """La limpieza es exclusiva de Excel; el CSV conserva el dato original."""
+    df = pd.DataFrame({"objeto": ["Prestación de servicios\x0b"]})
+    written = export_dataframe(df, tmp_path / "crudo.csv")
+    assert "\x0b" in written.read_text(encoding="utf-8-sig")
+
+
 def test_export_excel_falls_back_to_csv_when_too_many_rows(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

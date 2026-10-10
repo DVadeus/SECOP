@@ -195,14 +195,21 @@ def _classify(idx: pd.DataFrame, df: pd.DataFrame) -> _Batch:
 
 
 def _log_year_changes(idx: pd.DataFrame, df: pd.DataFrame, targets: pd.Series) -> None:
-    """Avisa de contratos que el origen pasó de un año real a otro (se conservan ambos)."""
+    """Avisa de contratos que el origen pasó de un año real a otro (se conservan ambos).
+
+    Sólo cuenta los cambios nuevos: el contrato llega a un año donde el lake aún
+    no lo tiene, y ya lo tiene en otro año real. Actualizar la copia de un
+    contrato que ya estaba en dos años no es un cambio nuevo.
+    """
     dated = idx[idx[id_index.COL_PARTITION] != lake.UNKNOWN_PARTITION]
     incoming = pd.DataFrame(
         {PRIMARY_KEY: df[PRIMARY_KEY].astype("string"), "target": targets}
     )
     incoming = incoming[incoming["target"] != lake.UNKNOWN_PARTITION]
     merged = incoming.merge(dated, on=PRIMARY_KEY)
-    changed = merged[merged["target"] != merged[id_index.COL_PARTITION]]
+    merged["already_there"] = merged["target"] == merged[id_index.COL_PARTITION]
+    already = merged.groupby([PRIMARY_KEY, "target"])["already_there"].transform("any")
+    changed = merged[~already]
     if not changed.empty:
         logger.warning(
             "%d contratos cambiaron de año de inicio en el origen; se conservan "

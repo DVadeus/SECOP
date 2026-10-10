@@ -35,6 +35,7 @@ from secop.config import (
     PARTITION_DATE_COLUMN,
     PRIMARY_KEY,
     RUN_MARKER_KEY,
+    STATE_KEY,
 )
 from secop.extract import fetch_by_ids, fetch_data, fetch_snapshot
 from secop.schema import SCHEMA_VERSION
@@ -131,9 +132,13 @@ def _begin(store: ObjectStore, mode: str) -> pd.DataFrame:
         idx = id_index.build_from_lake(store)
     else:
         idx = id_index.load_or_build(store)
+    _mark_running(store, mode)
+    return idx
+
+
+def _mark_running(store: ObjectStore, mode: str) -> None:
     marker = {"mode": mode, "started_at": datetime.now(UTC).isoformat()}
     store.put_bytes(RUN_MARKER_KEY, json.dumps(marker).encode("utf-8"))
-    return idx
 
 
 def _finish(store: ObjectStore, idx: pd.DataFrame, result: RunResult) -> None:
@@ -333,3 +338,69 @@ def incremental(store: ObjectStore) -> RunResult:
 
     _finish(store, idx, result)
     return result
+
+
+# --------------------------------------------------------------------------- #
+# Reparación de datos escritos por versiones anteriores del ETL               #
+# --------------------------------------------------------------------------- #
+@dataclass(slots=True)
+class RepairReport:
+    """Lo que ``repair`` encontró (y, con ``apply``, corrigió)."""
+
+    applied: bool
+    #: Ids en year=unknown que además están en un año real (se mueven).
+    unknown_with_date: int = 0
+    #: Ids en dos o más años reales (evidencia: no se tocan).
+    year_changes: int = 0
+    backup_prefix: str | None = None
+    result: RunResult = field(default_factory=lambda: RunResult(mode="repair"))
+
+
+def _backup(store: ObjectStore, keys: list[str], at: datetime) -> str:
+    """Copia (en el servidor) ``keys`` bajo ``backup/<timestamp>/``."""
+    prefix = f"backup/{at.strftime('%Y%m%dT%H%M%SZ')}"
+    for key in keys:
+        if store.exists(key):
+            store.copy(key, f"{prefix}/{key}")
+            logger.info("Respaldo: %s -> %s/%s", key, prefix, key)
+    return prefix
+
+
+def repair(store: ObjectStore, *, apply: bool = False) -> RepairReport:
+    """Saca de year=unknown los contratos que ya están en un año real.
+
+    Sin ``apply`` sólo informa. Con ``apply`` respalda antes lo que va a tocar;
+    las copias que salen de unknown quedan además en el historial.
+    """
+    idx = id_index.build_from_lake(store)
+    part = idx[id_index.COL_PARTITION]
+    unknown_ids = set(idx.loc[part == lake.UNKNOWN_PARTITION, PRIMARY_KEY])
+    dated = idx[part != lake.UNKNOWN_PARTITION]
+    dated_ids = set(dated[PRIMARY_KEY])
+    report = RepairReport(
+        applied=apply,
+        unknown_with_date=len(unknown_ids & dated_ids),
+        year_changes=int((dated.groupby(PRIMARY_KEY).size() > 1).sum()),
+    )
+    if not apply or not report.unknown_with_date:
+        return report
+
+    run_at = datetime.now(UTC)
+    report.backup_prefix = _backup(
+        store,
+        [lake.data_key(lake.UNKNOWN_PARTITION), STATE_KEY, MANIFEST_KEY],
+        run_at,
+    )
+    _mark_running(store, "repair")
+    remaining = lake.move_out_ids(
+        store,
+        lake.UNKNOWN_PARTITION,
+        unknown_ids & dated_ids,
+        motivo=history.MOTIVO_FECHA_COMPLETADA,
+        detected_at=run_at,
+    )
+    if remaining is not None:
+        idx = id_index.replace_partition(idx, lake.UNKNOWN_PARTITION, remaining)
+        _record(report.result, {lake.UNKNOWN_PARTITION: len(remaining)})
+    _finish(store, idx, report.result)
+    return report

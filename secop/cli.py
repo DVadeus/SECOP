@@ -94,6 +94,38 @@ def etl_incremental(
     _print_run_result(result)
 
 
+@etl_app.command("reparar")
+def etl_reparar(
+    aplicar: Annotated[
+        bool,
+        typer.Option(help="Aplicar los cambios (por defecto sólo se informa)."),
+    ] = False,
+    target: Annotated[str, typer.Option(help="Destino: 'r2' o 'local'.")] = "r2",
+) -> None:
+    """Saca de year=unknown los contratos que ya están en un año real.
+
+    Corrige lo escrito por versiones anteriores del ETL. Respalda antes en
+    backup/<fecha>/ y las copias movidas quedan en el historial.
+    """
+    from secop.pipeline import repair
+
+    report = repair(_store(target), apply=aplicar)
+    console.print(
+        f"Contratos en year=unknown que ya tienen año: "
+        f"[bold]{report.unknown_with_date:,}[/bold]"
+    )
+    console.print(
+        f"Contratos en dos o más años (evidencia, no se tocan): "
+        f"[bold]{report.year_changes:,}[/bold]"
+    )
+    if not report.applied:
+        console.print("[yellow]Sólo informe. Usa --aplicar para corregir.[/yellow]")
+        return
+    if report.backup_prefix:
+        console.print(f"Respaldo en: {report.backup_prefix}/")
+    _print_run_result(report.result)
+
+
 def _print_run_result(result: object) -> None:
     from secop.pipeline import RunResult
 

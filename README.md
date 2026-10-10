@@ -110,6 +110,21 @@ uv run secop sql "SELECT year, count(*) FROM contratos GROUP BY 1 ORDER BY 1"
 uv run secop sql "SELECT * FROM contratos WHERE documento_proveedor = '901261110'" -o foks.xlsx
 ```
 
+### Historial de versiones
+
+Cuando un contrato cambia (llega una versión con otro contenido), el lake principal
+guarda la versión vigente y la anterior se conserva en
+`raw/contratos_historial/detectado=AAAA-MM-DD/data.parquet` con el motivo y la fecha de
+detección. Nunca se borra. Se consulta aparte, para que `secop query` no devuelva
+duplicados:
+
+```bash
+uv run secop historial --nit-proveedor 830125075 -o historial_proveedor.xlsx
+uv run secop historial --nit-entidad 900475780 -o historial_unp.xlsx
+```
+
+En `secop sql` la vista se llama `contratos_historial`.
+
 ### Estado del lake
 
 ```bash

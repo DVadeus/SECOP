@@ -24,6 +24,8 @@ PARTITION_DATE_COLUMN = "fecha_de_inicio_del_contrato"
 LAKE_PREFIX = "raw/contratos"
 # Único archivo por partición (contrato: nunca part-*.parquet).
 DATA_FILE = "data.parquet"
+# Versiones reemplazadas de los contratos, particionadas por fecha de detección.
+HISTORY_PREFIX = "raw/contratos_historial"
 STATE_KEY = "state/contratos.json"
 MANIFEST_KEY = "_manifest.json"
 

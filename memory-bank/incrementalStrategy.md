@@ -1,44 +1,82 @@
 # Incremental Strategy
 
-The ETL is incremental.
-
-The extraction never scans the full dataset after the initial load.
+The ETL is incremental, but **not watermark-driven**.
 
 ---
 
-## Watermark
+## Why not a watermark
 
-The ETL stores `ultima_actualizacion` in `state/contratos.json` **in the object store**
-(R2), not on local disk, after every successful execution. This keeps the GitHub
-Actions runner stateless.
+Measured on 2026-10-09:
 
-A `lookback_days` window (default 2) is subtracted from the watermark on each run to
-absorb late-arriving updates; the upsert makes the overlap harmless.
-
----
-
-## Query
-
-```
-WHERE ultima_actualizacion > last_watermark
-```
+- `ultima_actualizacion` is NULL in ~38 % of the source (2.1 M of 5.6 M rows), and new
+  contracts usually arrive without it. A `WHERE ultima_actualizacion > X` query never
+  sees them (95,467 contracts were missing from R2 because of this).
+- datos.gov.co reloads the whole dataset daily: Socrata's `:created_at`/`:updated_at`
+  are the same for every row and `:id` changes, so system fields are useless too.
 
 ---
 
-## Duplicate detection
+## Light snapshot + id index
 
-Primary Key: `id_contrato`
+1. Download a **light snapshot** of the whole source: only `id_contrato`,
+   `ultima_actualizacion`, `fecha_de_inicio_del_contrato` (~10 min).
+   `rowsUpdatedAt` (metadata API) is checked before and after; if the source was
+   reloaded in between, the run aborts without writing (`SourceReloadedError`).
+2. Compare it with the **id index** `state/id_index.parquet` (one row per
+   `id_contrato` × partition, mirrors the lake) — `secop.diff`. Fetch an id when:
+   - it is not in its target partition (new contract, `unknown` that now has a date,
+     start-year change), or
+   - it is there but the source has a newer `ultima_actualizacion`
+     (or the lake has it NULL), or
+   - the source dropped its start date and brings a newer version.
+3. Download only those ids (`id_contrato in (...)`, 200 per request) and apply them in
+   batches of 50,000 ids.
 
-Version: `ultima_actualizacion` (greatest wins)
+`ultima_actualizacion` in `state/contratos.json` is informational only (max in the
+index). A resumed backfill can no longer cause lost updates: each id is compared with
+its own version.
 
-Applied at write time in `secop.lake.compact()` — both within the incoming batch and
-against the existing partition file.
+Known blind spot: a row with NULL `ultima_actualizacion` that changes other fields
+without changing partition is not detected (there is no signal). A forced backfill of
+that year picks it up (it merges, never deletes).
+
+---
+
+## Never delete
+
+Contracts are never removed from the lake, even if the source stops publishing them
+(as of 2026-10-09, 491,931 ids in R2 are no longer in the source, mostly `Borrador` /
+`Cancelado`). SECOP is a national public record; disappearances are evidence.
+
+- Backfill always merges with existing partitions, also with `--force`.
+- Replaced versions go to `raw/contratos_historial/detectado=YYYY-MM-DD/data.parquet`
+  (see `datasetContract.md`), queried with `secop historial`.
+
+---
+
+## Cross-partition rules
+
+- `year=unknown` → real year: the dated version is written to its year; the undated copy
+  leaves `unknown` and goes to history (`fecha_completada`).
+- Year A → year B: **both copies are kept** in the main lake (evidence of the source
+  changing the start date); the run logs a warning.
+- Real year → no date in source: the dated version stays; the new undated version goes
+  to history (`fecha_eliminada_en_origen`).
 
 ---
 
 ## Restart
 
-If the ETL crashes, the watermark is NOT updated (it is written last, only after every
-touched partition uploaded successfully). The next execution re-fetches the overlap and
-the upsert deduplicates it. Backfill is resumable per year: an existing
-`year=YYYY/data.parquet` is skipped unless `--force`.
+Each run writes `state/run_in_progress.json` first and deletes it last. If it exists
+when a run starts, the previous run crashed after writing some partitions but before
+saving the index: the index is rebuilt from the lake (~30 s on R2). History is written
+before the partition it comes from, and appends are idempotent (content hash), so a
+re-run never loses or duplicates versions. Backfill is resumable per year.
+
+---
+
+## Repair
+
+`secop etl reparar [--aplicar]` fixes data written by older ETL versions: moves out of
+`year=unknown` the contracts that already exist in a real year (to history), after
+backing up `year=unknown`, state and manifest under `backup/<timestamp>/`.

@@ -39,10 +39,11 @@ The ETL must:
 - download new records
 - avoid duplicate downloads
 - detect updated records
-- preserve historical versions when necessary
+- preserve every replaced version (`raw/contratos_historial/`, `secop historial`)
+- never delete a contract, even if the source removes it (it may be evidence)
 - generate parquet files (one compacted `data.parquet` per `year=` partition)
 - upload them to Cloudflare R2 (S3 API)
-- maintain metadata (`state/contratos.json`, `_manifest.json`)
+- maintain metadata (`state/contratos.json`, `state/id_index.parquet`, `_manifest.json`)
 - be restartable after failures
 - be idempotent (upsert by `id_contrato`)
 - minimize API usage

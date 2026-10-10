@@ -14,6 +14,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # Dataset SECOP II "Contratos Electrónicos" en datos.gov.co (API Socrata).
 DATASET_ID = "jbjy-vk9h"
 SOCRATA_RESOURCE_URL = f"https://www.datos.gov.co/resource/{DATASET_ID}.json"
+SOCRATA_METADATA_URL = f"https://www.datos.gov.co/api/views/{DATASET_ID}.json"
 
 # Clave primaria y columna incremental del dataset (ver memory-bank/datasetContract.md).
 PRIMARY_KEY = "id_contrato"

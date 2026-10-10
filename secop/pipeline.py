@@ -27,7 +27,7 @@ from datetime import UTC, datetime, timedelta
 
 import pandas as pd
 
-from secop import history, lake
+from secop import diff, history, lake
 from secop import index as id_index
 from secop.config import (
     DATASET_ID,
@@ -36,7 +36,7 @@ from secop.config import (
     PRIMARY_KEY,
     WATERMARK_COLUMN,
 )
-from secop.extract import fetch_data
+from secop.extract import fetch_by_ids, fetch_data, fetch_snapshot
 from secop.schema import SCHEMA_VERSION
 from secop.state import PipelineState, load_state, save_state
 from secop.storage.base import ObjectStore
@@ -45,6 +45,10 @@ from secop.transform import to_dataframe
 logger = logging.getLogger(__name__)
 
 _SOCRATA_TS = "%Y-%m-%dT%H:%M:%S"
+
+# Ids por lote aplicado al lake en el incremental: acota la memoria (filas
+# completas de ~80 columnas) a costa de reescribir particiones por lote.
+FETCH_CHUNK_IDS = 50_000
 
 
 @dataclass(slots=True)
@@ -293,29 +297,57 @@ def backfill(
 # --------------------------------------------------------------------------- #
 # Incremental                                                                 #
 # --------------------------------------------------------------------------- #
+def _chunks(items: list[str], size: int) -> list[list[str]]:
+    return [items[i : i + size] for i in range(0, len(items), size)]
+
+
+def _sync_missing(
+    store: ObjectStore, idx: pd.DataFrame, run_at: datetime, result: RunResult
+) -> tuple[pd.DataFrame, datetime | None]:
+    """Baja los ids que el lake no tiene en su partición destino.
+
+    Cubre lo que el watermark no ve: contratos nuevos sin
+    ``ultima_actualizacion``, ``unknown`` que ya tienen fecha y cambios de año.
+    """
+    snapshot = fetch_snapshot(diff.SNAPSHOT_COLUMNS)
+    missing = diff.ids_to_fetch(snapshot, idx)
+    del snapshot
+    max_wm: datetime | None = None
+    for chunk in _chunks(missing, FETCH_CHUNK_IDS):
+        df = to_dataframe(fetch_by_ids(chunk))
+        idx, written = _apply_batch(store, idx, df, run_at)
+        _record(result, written)
+        wm = _batch_watermark(df)
+        if wm and (max_wm is None or wm > max_wm):
+            max_wm = wm
+    return idx, max_wm
+
+
 def incremental(store: ObjectStore, *, lookback_days: int = 2) -> RunResult:
-    """Descarga sólo lo cambiado desde el watermark y hace upsert por partición."""
+    """Pone el lake al día con el origen sin borrar nada.
+
+    1. Cambios con ``ultima_actualizacion`` posterior al watermark.
+    2. Ids que faltan en su partición según la foto ligera del origen.
+    """
     result = RunResult(mode="incremental")
     state = load_state(store)
+    idx = id_index.load_or_build(store)
+    run_at = datetime.now(UTC)
+
     since = state.watermark - timedelta(days=lookback_days)
     where = f"{WATERMARK_COLUMN} > '{since.strftime(_SOCRATA_TS)}'"
     logger.info("Extrayendo cambios desde %s (lookback %dd)", since, lookback_days)
-
-    df = _fetch_frame(where)
-    if df.empty:
-        logger.info("No hay registros nuevos")
-        result.new_watermark = state.ultima_actualizacion
-        return result
-
-    idx = id_index.load_or_build(store)
-    idx, written = _apply_batch(store, idx, df, datetime.now(UTC))
+    changed = _fetch_frame(where)
+    idx, written = _apply_batch(store, idx, changed, run_at)
     _record(result, written)
+
+    idx, missing_wm = _sync_missing(store, idx, run_at, result)
+
+    for new_wm in (_batch_watermark(changed), missing_wm):
+        if new_wm is not None and new_wm > state.watermark:
+            state.ultima_actualizacion = new_wm.isoformat()
     state.row_counts = id_index.row_counts(idx)
     id_index.save(store, idx)
-
-    new_wm = _batch_watermark(df)
-    if new_wm is not None and new_wm > state.watermark:
-        state.ultima_actualizacion = new_wm.isoformat()
     state.schema_version = SCHEMA_VERSION
     save_state(store, state)
     _write_manifest(store, state)

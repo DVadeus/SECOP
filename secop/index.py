@@ -73,6 +73,12 @@ def replace_partition(
     return pd.concat([kept, entries_for(partition, rows)], ignore_index=True)
 
 
+def row_counts(index: pd.DataFrame) -> dict[str, int]:
+    """Filas por partición de TODO el lake (no sólo lo tocado en la corrida)."""
+    counts = index.groupby(COL_PARTITION).size()
+    return {str(p): int(n) for p, n in sorted(counts.items())}
+
+
 def load(store: ObjectStore) -> pd.DataFrame | None:
     """Carga el índice, o ``None`` si aún no existe."""
     try:

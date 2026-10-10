@@ -276,12 +276,8 @@ def backfill(
 
     id_index.save(store, idx)
     state = load_state(store)
-    # Conteos: los que se escribieron en esta corrida ya los tenemos; evita
-    # releer todo el lake desde R2 sólo para contar filas.
-    if only_year is None:
-        state.row_counts = dict(result.partitions)
-    else:
-        state.row_counts.update(result.partitions)
+    # Conteos de todo el lake (incluye los años omitidos por ya existir).
+    state.row_counts = id_index.row_counts(idx)
     # Sólo el backfill completo fija el watermark inicial. Un --year puntual no lo
     # mueve (podría adelantarlo más allá de lo realmente descargado en otros años).
     if max_wm is not None and only_year is None:
@@ -314,7 +310,7 @@ def incremental(store: ObjectStore, *, lookback_days: int = 2) -> RunResult:
     idx = id_index.load_or_build(store)
     idx, written = _apply_batch(store, idx, df, datetime.now(UTC))
     _record(result, written)
-    state.row_counts.update(written)
+    state.row_counts = id_index.row_counts(idx)
     id_index.save(store, idx)
 
     new_wm = _batch_watermark(df)

@@ -22,6 +22,8 @@ PARTITION_DATE_COLUMN = "fecha_de_inicio_del_contrato"
 
 # Prefijos dentro del bucket / directorio de datos.
 LAKE_PREFIX = "raw/contratos"
+# Único archivo por partición (contrato: nunca part-*.parquet).
+DATA_FILE = "data.parquet"
 STATE_KEY = "state/contratos.json"
 MANIFEST_KEY = "_manifest.json"
 
@@ -59,8 +61,8 @@ class Settings(BaseSettings):
     r2_endpoint: str | None = Field(default=None, validation_alias="R2_ENDPOINT")
 
     # --- Local ------------------------------------------------------------------
-    # Raíz del lake local (espejo de la estructura de R2). El histórico heredado
-    # en data/raw/ queda aparte como caché de exploración.
+    # Raíz del lake local (espejo de la estructura de R2). data/raw/ es la caché
+    # del ETL viejo (part-*.parquet sin compactar): no usarla como lake.
     local_data_dir: Path = Field(
         default=REPO_ROOT / "data" / "lake",
         validation_alias="SECOP_LOCAL_DATA_DIR",

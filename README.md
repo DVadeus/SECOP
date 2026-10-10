@@ -118,11 +118,16 @@ uv run secop info
 
 ### Sin conexión (Parquet local)
 
-Todos los comandos de consulta aceptan `--source local [--path <dir>]`:
+Todos los comandos de consulta aceptan `--source local [--path <dir>]`. Sin `--path`
+se lee el lake local por defecto, `data/lake/raw/contratos/` (configurable con
+`SECOP_LOCAL_DATA_DIR`), que se llena con `secop etl ... --target local`:
 
 ```bash
-uv run secop query --nit-entidad 900475780 --source local --path data/raw -o unp.xlsx
+uv run secop query --nit-entidad 900475780 --source local -o unp.xlsx
 ```
+
+Sólo se leen los `year=*/data.parquet` compactados. `data/raw/` es la caché del ETL
+viejo (archivos `part-*.parquet` sin deduplicar) y no debe usarse como lake.
 
 ### Notebook
 

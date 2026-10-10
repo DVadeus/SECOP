@@ -9,7 +9,7 @@ from types import TracebackType
 import duckdb
 import pandas as pd
 
-from secop.config import LAKE_PREFIX, Settings, get_settings
+from secop.config import DATA_FILE, LAKE_PREFIX, Settings, get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -54,9 +54,10 @@ class QueryEngine:
             glob = cls._configure_r2(con, settings)
         elif source == "local":
             base = Path(path) if path else settings.local_data_dir / LAKE_PREFIX
-            # Sólo directorios "year=..."; así se ignora cualquier carpeta
-            # heredada sin partición Hive (p.ej. data/raw/nulls/).
-            glob = f"{base.as_posix().rstrip('/')}/**/year=*/*.parquet"
+            # Sólo el data.parquet compactado de cada "year=..."; así se ignoran
+            # los part-*.parquet y carpetas sin partición Hive del ETL viejo
+            # (p.ej. data/raw/nulls/).
+            glob = f"{base.as_posix().rstrip('/')}/**/year=*/{DATA_FILE}"
         else:
             raise ValueError(f"source desconocido: {source!r} (usa 'r2' o 'local')")
         return cls(con, glob)
@@ -73,7 +74,7 @@ class QueryEngine:
                 f"CREATE OR REPLACE SECRET secop_r2 (TYPE r2, "
                 f"ACCOUNT_ID '{account}', KEY_ID '{key}', SECRET '{secret}')"
             )
-            return f"r2://{settings.r2_bucket}/{LAKE_PREFIX}/**/*.parquet"
+            return f"r2://{settings.r2_bucket}/{LAKE_PREFIX}/year=*/{DATA_FILE}"
         except duckdb.Error as exc:  # pragma: no cover - fallback poco común
             logger.warning("SECRET TYPE r2 falló (%s); se usa TYPE s3", exc)
             endpoint = _q((settings.r2_endpoint_url or "").removeprefix("https://"))
@@ -82,7 +83,7 @@ class QueryEngine:
                 f"KEY_ID '{key}', SECRET '{secret}', "
                 f"ENDPOINT '{endpoint}', URL_STYLE 'path', REGION 'auto')"
             )
-            return f"s3://{settings.r2_bucket}/{LAKE_PREFIX}/**/*.parquet"
+            return f"s3://{settings.r2_bucket}/{LAKE_PREFIX}/year=*/{DATA_FILE}"
 
     # -- API -------------------------------------------------------------- #
     def run(self, sql: str, params: list[object] | None = None) -> pd.DataFrame:

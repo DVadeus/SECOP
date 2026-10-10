@@ -17,6 +17,7 @@ import pandas as pd
 
 from secop import schema
 from secop.config import (
+    DATA_FILE,
     LAKE_PREFIX,
     PARTITION_DATE_COLUMN,
     PRIMARY_KEY,
@@ -46,7 +47,7 @@ def partition_for_year(year: int | None) -> str:
 
 def data_key(partition: str) -> str:
     """Clave del objeto Parquet de una partición."""
-    return f"{LAKE_PREFIX}/{partition}/data.parquet"
+    return f"{LAKE_PREFIX}/{partition}/{DATA_FILE}"
 
 
 def assign_partitions(df: pd.DataFrame) -> pd.Series:
@@ -139,6 +140,6 @@ def list_partitions(store: ObjectStore) -> list[str]:
     parts = {
         key[len(prefix) :].split("/", 1)[0]
         for key in store.list_keys(prefix)
-        if key.endswith("data.parquet")
+        if key.endswith(f"/{DATA_FILE}")
     }
     return sorted(parts)

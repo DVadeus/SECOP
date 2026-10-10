@@ -26,6 +26,8 @@ SNAPSHOT_COLUMNS = (PRIMARY_KEY, WATERMARK_COLUMN, PARTITION_DATE_COLUMN)
 
 
 def _prepare_snapshot(snapshot: pd.DataFrame) -> pd.DataFrame:
+    # Una columna ausente en todas las páginas (p.ej. todo nulo) cuenta como nula.
+    snapshot = snapshot.reindex(columns=list(SNAPSHOT_COLUMNS))
     out = pd.DataFrame(
         {
             PRIMARY_KEY: snapshot[PRIMARY_KEY].astype("string"),

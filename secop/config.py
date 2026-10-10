@@ -30,6 +30,9 @@ HISTORY_PREFIX = "raw/contratos_historial"
 STATE_KEY = "state/contratos.json"
 # Índice (id_contrato, partición, ultima_actualizacion): espejo ligero del lake.
 INDEX_KEY = "state/id_index.parquet"
+# Marca de corrida en curso: si existe al empezar, la anterior se cayó a medias
+# y el índice puede no reflejar el lake (se reconstruye).
+RUN_MARKER_KEY = "state/run_in_progress.json"
 MANIFEST_KEY = "_manifest.json"
 
 # Primer año con datos utilizables en el dataset.

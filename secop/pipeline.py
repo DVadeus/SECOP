@@ -34,6 +34,7 @@ from secop.config import (
     MANIFEST_KEY,
     PARTITION_DATE_COLUMN,
     PRIMARY_KEY,
+    RUN_MARKER_KEY,
 )
 from secop.extract import fetch_by_ids, fetch_data, fetch_snapshot
 from secop.schema import SCHEMA_VERSION
@@ -119,6 +120,22 @@ def _write_manifest(store: ObjectStore, state: PipelineState) -> None:
     )
 
 
+def _begin(store: ObjectStore, mode: str) -> pd.DataFrame:
+    """Marca la corrida como en curso y devuelve un índice fiable.
+
+    Si la marca ya existía, la corrida anterior se cayó tras escribir alguna
+    partición pero antes de guardar el índice: se reconstruye desde el lake.
+    """
+    if store.exists(RUN_MARKER_KEY):
+        logger.warning("La corrida anterior no terminó; se reconstruye el índice")
+        idx = id_index.build_from_lake(store)
+    else:
+        idx = id_index.load_or_build(store)
+    marker = {"mode": mode, "started_at": datetime.now(UTC).isoformat()}
+    store.put_bytes(RUN_MARKER_KEY, json.dumps(marker).encode("utf-8"))
+    return idx
+
+
 def _finish(store: ObjectStore, idx: pd.DataFrame, result: RunResult) -> None:
     """Persiste índice, estado y manifest. Va al final: sólo tras escribir todo."""
     id_index.save(store, idx)
@@ -132,6 +149,7 @@ def _finish(store: ObjectStore, idx: pd.DataFrame, result: RunResult) -> None:
     state.schema_version = SCHEMA_VERSION
     save_state(store, state)
     _write_manifest(store, state)
+    store.delete(RUN_MARKER_KEY)
     result.new_watermark = state.ultima_actualizacion
 
 
@@ -209,10 +227,17 @@ def _apply_batch(
         idx = id_index.replace_partition(idx, str(partition), rows)
         written[str(partition)] = len(rows)
     # Después de escribir las versiones con fecha: sacar sus copias de unknown.
+    # El índice (fiable gracias a la marca de corrida) evita leer year=unknown
+    # cuando ningún id del lote está ahí.
+    in_unknown = batch.dated_ids & set(
+        idx.loc[idx[id_index.COL_PARTITION] == lake.UNKNOWN_PARTITION, PRIMARY_KEY]
+    )
+    if not in_unknown:
+        return idx, written
     remaining = lake.move_out_ids(
         store,
         lake.UNKNOWN_PARTITION,
-        batch.dated_ids,
+        in_unknown,
         motivo=history.MOTIVO_FECHA_COMPLETADA,
         detected_at=detected_at,
     )
@@ -248,7 +273,7 @@ def backfill(
     years = (
         [only_year] if only_year is not None else list(range(start_year, end_year + 1))
     )
-    idx = id_index.load_or_build(store)
+    idx = _begin(store, "backfill")
     run_at = datetime.now(UTC)
 
     for year in years:
@@ -295,7 +320,7 @@ def incremental(store: ObjectStore) -> RunResult:
     ``unknown`` que ya tienen fecha, cambios de año y versiones más nuevas.
     """
     result = RunResult(mode="incremental")
-    idx = id_index.load_or_build(store)
+    idx = _begin(store, "incremental")
     run_at = datetime.now(UTC)
 
     snapshot = fetch_snapshot(diff.SNAPSHOT_COLUMNS)

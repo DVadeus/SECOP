@@ -144,7 +144,34 @@ def test_incremental_without_changes_writes_no_partition(
     _fake_source(monkeypatch, [rec])
     result = pipeline.incremental(store)
     assert result.partitions == {}
-    assert result.rows_written == 0
+    assert result.contracts_written == 0
+
+
+def test_run_result_counts_contracts_not_partition_sizes(
+    store: LocalStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Varios lotes sobre una misma partición no deben sumar su tamaño cada vez."""
+    _seed(
+        store,
+        "year=2026",
+        [
+            _rec(f"OLD{n}", "2026-01-01T00:00:00", "2026-01-01T00:00:00")
+            for n in range(5)
+        ],
+    )
+    _fake_source(
+        monkeypatch,
+        [
+            _rec(f"NEW{n}", "2026-02-01T00:00:00", "2026-09-01T00:00:00")
+            for n in range(3)
+        ],
+    )
+    monkeypatch.setattr(pipeline, "FETCH_CHUNK_IDS", 1)  # 3 lotes
+
+    result = pipeline.incremental(store)
+
+    assert result.contracts_written == 3
+    assert result.partitions == {"year=2026": 8}  # tamaño final, no 6 + 7 + 8
 
 
 def test_state_watermark_is_informative_maximum(

@@ -130,15 +130,18 @@ def _print_run_result(result: object) -> None:
     from secop.pipeline import RunResult
 
     assert isinstance(result, RunResult)
-    table = Table(title=f"Corrida: {result.mode}")
+    table = Table(title=f"Corrida: {result.mode} — particiones reescritas")
     table.add_column("Partición")
-    table.add_column("Filas", justify="right")
+    table.add_column("Filas totales", justify="right")
     for partition, count in sorted(result.partitions.items()):
         table.add_row(partition, f"{count:,}")
     if result.skipped:
         table.add_row("(omitidas)", ", ".join(result.skipped))
     console.print(table)
-    console.print(f"Filas escritas: [bold]{result.rows_written:,}[/bold]")
+    console.print(
+        "Contratos escritos (nuevos o actualizados): "
+        f"[bold]{result.contracts_written:,}[/bold]"
+    )
     console.print(f"Watermark: [bold]{result.new_watermark}[/bold]")
 
 

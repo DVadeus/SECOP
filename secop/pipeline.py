@@ -57,7 +57,11 @@ class RunResult:
     """Resumen de una corrida del pipeline."""
 
     mode: str
-    rows_written: int = 0
+    #: Versiones de contratos aplicadas al lake (nuevas o actualizadas). No es el
+    #: tamaño de las particiones: una partición reescrita en varios lotes cuenta
+    #: sólo las filas que llegaron.
+    contracts_written: int = 0
+    #: Filas totales de cada partición reescrita, al terminar la corrida.
     partitions: dict[str, int] = field(default_factory=dict)
     new_watermark: str | None = None
     skipped: list[str] = field(default_factory=list)
@@ -210,12 +214,16 @@ def _log_year_changes(idx: pd.DataFrame, df: pd.DataFrame, targets: pd.Series) -
 
 def _apply_batch(
     store: ObjectStore, idx: pd.DataFrame, df: pd.DataFrame, detected_at: datetime
-) -> tuple[pd.DataFrame, dict[str, int]]:
-    """Escribe un lote en el lake sin borrar nada. Devuelve (índice, filas/partición)."""
+) -> tuple[pd.DataFrame, dict[str, int], int]:
+    """Escribe un lote en el lake sin borrar nada.
+
+    Devuelve (índice, filas totales por partición reescrita, contratos aplicados).
+    """
     written: dict[str, int] = {}
     if df.empty or PRIMARY_KEY not in df.columns:
-        return idx, written
+        return idx, written, 0
     batch = _classify(idx, df)
+    applied = len(batch.to_write)
     _log_year_changes(idx, batch.to_write, batch.targets)
     if not batch.lost_date.empty:
         history.append(
@@ -238,7 +246,7 @@ def _apply_batch(
         idx.loc[idx[id_index.COL_PARTITION] == lake.UNKNOWN_PARTITION, PRIMARY_KEY]
     )
     if not in_unknown:
-        return idx, written
+        return idx, written, applied
     remaining = lake.move_out_ids(
         store,
         lake.UNKNOWN_PARTITION,
@@ -249,13 +257,13 @@ def _apply_batch(
     if remaining is not None:
         idx = id_index.replace_partition(idx, lake.UNKNOWN_PARTITION, remaining)
         written[lake.UNKNOWN_PARTITION] = len(remaining)
-    return idx, written
+    return idx, written, applied
 
 
-def _record(result: RunResult, written: dict[str, int]) -> None:
-    for partition, rows in written.items():
-        result.partitions[partition] = rows
-        result.rows_written += rows
+def _record(result: RunResult, written: dict[str, int], applied: int = 0) -> None:
+    # Una partición reescrita en varios lotes queda con su tamaño final.
+    result.partitions.update(written)
+    result.contracts_written += applied
 
 
 # --------------------------------------------------------------------------- #
@@ -294,16 +302,16 @@ def backfill(
             logger.warning("Año %d sin registros", year)
             continue
 
-        idx, written = _apply_batch(store, idx, year_df, run_at)
-        _record(result, written)
+        idx, written, applied = _apply_batch(store, idx, year_df, run_at)
+        _record(result, written, applied)
 
     if only_year is None:
         logger.info(
             "Descargando registros fuera de rango (nulos / previos / futuros)..."
         )
         tail_df = _fetch_tail(start_year, end_year)
-        idx, written = _apply_batch(store, idx, tail_df, run_at)
-        _record(result, written)
+        idx, written, applied = _apply_batch(store, idx, tail_df, run_at)
+        _record(result, written, applied)
 
     _finish(store, idx, result)
     return result
@@ -333,8 +341,8 @@ def incremental(store: ObjectStore) -> RunResult:
     del snapshot
     for chunk in _chunks(to_fetch, FETCH_CHUNK_IDS):
         df = to_dataframe(fetch_by_ids(chunk))
-        idx, written = _apply_batch(store, idx, df, run_at)
-        _record(result, written)
+        idx, written, applied = _apply_batch(store, idx, df, run_at)
+        _record(result, written, applied)
 
     _finish(store, idx, result)
     return result

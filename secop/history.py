@@ -20,7 +20,13 @@ from secop.storage.base import ObjectStore
 
 logger = logging.getLogger(__name__)
 
+#: Otra versión del mismo contrato, en la misma partición, la reemplazó.
 MOTIVO_VERSION = "version_reemplazada"
+#: Estaba en year=unknown y llegó una versión con fecha de inicio: se movió.
+MOTIVO_FECHA_COMPLETADA = "fecha_completada"
+#: El origen quitó la fecha de inicio a un contrato que ya la tenía en el lake;
+#: la versión con fecha se conserva y la nueva (sin fecha) queda aquí.
+MOTIVO_FECHA_ELIMINADA = "fecha_eliminada_en_origen"
 
 COL_MOTIVO = "historial_motivo"
 COL_DETECTADO = "historial_detectado_utc"

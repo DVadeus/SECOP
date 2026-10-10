@@ -5,7 +5,16 @@ Refactor de ``pipelines/secop_pipeline.py``. Diferencias clave:
 * el estado vive en el object store, no en disco;
 * cada partición se **compacta** (upsert por ``id_contrato``) en vez de acumular
   archivos ``part-*`` duplicados;
-* el backfill descarga por mes para acotar memoria y es **reanudable**.
+* el backfill descarga por mes para acotar memoria y es **reanudable**;
+* **nunca se borran contratos**: si el origen los elimina, siguen en el lake.
+
+Reglas entre particiones (``_apply_batch``):
+
+* ``year=unknown`` -> año real: la versión con fecha se escribe en su año y la
+  copia sin fecha sale de ``unknown`` hacia el historial (``fecha_completada``);
+* año A -> año B: se conservan ambas copias (evidencia de cambio en el origen);
+* año real -> sin fecha: se conserva la versión con fecha y la nueva va al
+  historial (``fecha_eliminada_en_origen``).
 """
 
 from __future__ import annotations
@@ -18,11 +27,13 @@ from datetime import UTC, datetime, timedelta
 
 import pandas as pd
 
-from secop import lake
+from secop import history, lake
+from secop import index as id_index
 from secop.config import (
     DATASET_ID,
     MANIFEST_KEY,
     PARTITION_DATE_COLUMN,
+    PRIMARY_KEY,
     WATERMARK_COLUMN,
 )
 from secop.extract import fetch_data
@@ -117,6 +128,99 @@ def _batch_watermark(df: pd.DataFrame) -> datetime | None:
 
 
 # --------------------------------------------------------------------------- #
+# Escritura de un lote con reglas entre particiones                           #
+# --------------------------------------------------------------------------- #
+@dataclass(slots=True)
+class _Batch:
+    """Lote ya clasificado por partición destino."""
+
+    to_write: pd.DataFrame
+    targets: pd.Series
+    dated_ids: set[str]
+    lost_date: pd.DataFrame
+
+
+def _classify(idx: pd.DataFrame, df: pd.DataFrame) -> _Batch:
+    targets = lake.assign_partitions(df)
+    unknown = targets == lake.UNKNOWN_PARTITION
+    dated_ids = set(df.loc[~unknown, PRIMARY_KEY].dropna().astype(str))
+    in_lake_dated = idx.loc[
+        idx[id_index.COL_PARTITION] != lake.UNKNOWN_PARTITION, PRIMARY_KEY
+    ]
+    # Versiones sin fecha de contratos que sí tienen fecha (en el lake o en el
+    # mismo lote): no van a year=unknown, se guardan en el historial.
+    has_date = df[PRIMARY_KEY].isin(dated_ids) | df[PRIMARY_KEY].isin(in_lake_dated)
+    lost = unknown & has_date
+    return _Batch(
+        to_write=df[~lost],
+        targets=targets[~lost],
+        dated_ids=dated_ids,
+        lost_date=df[lost],
+    )
+
+
+def _log_year_changes(idx: pd.DataFrame, df: pd.DataFrame, targets: pd.Series) -> None:
+    """Avisa de contratos que el origen pasó de un año real a otro (se conservan ambos)."""
+    dated = idx[idx[id_index.COL_PARTITION] != lake.UNKNOWN_PARTITION]
+    incoming = pd.DataFrame(
+        {PRIMARY_KEY: df[PRIMARY_KEY].astype("string"), "target": targets}
+    )
+    incoming = incoming[incoming["target"] != lake.UNKNOWN_PARTITION]
+    merged = incoming.merge(dated, on=PRIMARY_KEY)
+    changed = merged[merged["target"] != merged[id_index.COL_PARTITION]]
+    if not changed.empty:
+        logger.warning(
+            "%d contratos cambiaron de año de inicio en el origen; se conservan "
+            "ambas copias (p.ej. %s)",
+            changed[PRIMARY_KEY].nunique(),
+            ", ".join(changed[PRIMARY_KEY].astype(str).unique()[:5]),
+        )
+
+
+def _apply_batch(
+    store: ObjectStore, idx: pd.DataFrame, df: pd.DataFrame, detected_at: datetime
+) -> tuple[pd.DataFrame, dict[str, int]]:
+    """Escribe un lote en el lake sin borrar nada. Devuelve (índice, filas/partición)."""
+    written: dict[str, int] = {}
+    if df.empty or PRIMARY_KEY not in df.columns:
+        return idx, written
+    batch = _classify(idx, df)
+    _log_year_changes(idx, batch.to_write, batch.targets)
+    if not batch.lost_date.empty:
+        history.append(
+            store,
+            batch.lost_date,
+            partition=lake.UNKNOWN_PARTITION,
+            motivo=history.MOTIVO_FECHA_ELIMINADA,
+            detected_at=detected_at,
+        )
+    for partition, group in batch.to_write.groupby(batch.targets):
+        rows = lake.upsert_partition(
+            store, str(partition), group, detected_at=detected_at
+        )
+        idx = id_index.replace_partition(idx, str(partition), rows)
+        written[str(partition)] = len(rows)
+    # Después de escribir las versiones con fecha: sacar sus copias de unknown.
+    remaining = lake.move_out_ids(
+        store,
+        lake.UNKNOWN_PARTITION,
+        batch.dated_ids,
+        motivo=history.MOTIVO_FECHA_COMPLETADA,
+        detected_at=detected_at,
+    )
+    if remaining is not None:
+        idx = id_index.replace_partition(idx, lake.UNKNOWN_PARTITION, remaining)
+        written[lake.UNKNOWN_PARTITION] = len(remaining)
+    return idx, written
+
+
+def _record(result: RunResult, written: dict[str, int]) -> None:
+    for partition, rows in written.items():
+        result.partitions[partition] = rows
+        result.rows_written += rows
+
+
+# --------------------------------------------------------------------------- #
 # Backfill                                                                    #
 # --------------------------------------------------------------------------- #
 def backfill(
@@ -127,12 +231,18 @@ def backfill(
     force: bool = False,
     only_year: int | None = None,
 ) -> RunResult:
-    """Carga histórica: un ``data.parquet`` compactado por año. Reanudable."""
+    """Carga histórica, un año a la vez. Reanudable.
+
+    Siempre fusiona con lo que ya hay en el lake: ``force`` vuelve a descargar
+    años existentes, pero nunca elimina contratos que el origen ya no publique.
+    """
     result = RunResult(mode="backfill")
     years = (
         [only_year] if only_year is not None else list(range(start_year, end_year + 1))
     )
     max_wm: datetime | None = None
+    idx = id_index.load_or_build(store)
+    run_at = datetime.now(UTC)
 
     for year in years:
         partition = f"year={year}"
@@ -147,9 +257,8 @@ def backfill(
             logger.warning("Año %d sin registros", year)
             continue
 
-        written = lake.write_new_partition(store, partition, year_df)
-        result.partitions[partition] = written
-        result.rows_written += written
+        idx, written = _apply_batch(store, idx, year_df, run_at)
+        _record(result, written)
         wm = _batch_watermark(year_df)
         if wm and (max_wm is None or wm > max_wm):
             max_wm = wm
@@ -159,15 +268,13 @@ def backfill(
             "Descargando registros fuera de rango (nulos / previos / futuros)..."
         )
         tail_df = _fetch_tail(start_year, end_year)
-        if not tail_df.empty:
-            for partition, group in tail_df.groupby(lake.assign_partitions(tail_df)):
-                written = lake.upsert_partition(store, str(partition), group)
-                result.partitions[str(partition)] = written
-                result.rows_written += written
-            wm = _batch_watermark(tail_df)
-            if wm and (max_wm is None or wm > max_wm):
-                max_wm = wm
+        idx, written = _apply_batch(store, idx, tail_df, run_at)
+        _record(result, written)
+        wm = _batch_watermark(tail_df)
+        if wm and (max_wm is None or wm > max_wm):
+            max_wm = wm
 
+    id_index.save(store, idx)
     state = load_state(store)
     # Conteos: los que se escribieron en esta corrida ya los tenemos; evita
     # releer todo el lake desde R2 sólo para contar filas.
@@ -204,12 +311,11 @@ def incremental(store: ObjectStore, *, lookback_days: int = 2) -> RunResult:
         result.new_watermark = state.ultima_actualizacion
         return result
 
-    df = lake.compact(df)  # dedup dentro del lote antes de tocar el lake
-    for partition, group in df.groupby(lake.assign_partitions(df)):
-        written = lake.upsert_partition(store, str(partition), group)
-        state.row_counts[str(partition)] = written
-        result.partitions[str(partition)] = written
-        result.rows_written += written
+    idx = id_index.load_or_build(store)
+    idx, written = _apply_batch(store, idx, df, datetime.now(UTC))
+    _record(result, written)
+    state.row_counts.update(written)
+    id_index.save(store, idx)
 
     new_wm = _batch_watermark(df)
     if new_wm is not None and new_wm > state.watermark:

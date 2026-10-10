@@ -197,7 +197,7 @@ def _apply_merge(
     existing: pd.DataFrame | None,
     incoming: pd.DataFrame,
     detected_at: datetime | None,
-) -> int:
+) -> pd.DataFrame:
     result = merge_versions(existing, incoming)
     # Historial ANTES que la partición: si la escritura de la partición falla,
     # la versión reemplazada ya está a salvo (y append es idempotente).
@@ -208,7 +208,8 @@ def _apply_merge(
         motivo=history.MOTIVO_VERSION,
         detected_at=detected_at,
     )
-    return write_partition(store, partition, result.rows)
+    write_partition(store, partition, result.rows)
+    return result.rows
 
 
 def upsert_partition(
@@ -217,8 +218,12 @@ def upsert_partition(
     new_rows: pd.DataFrame,
     *,
     detected_at: datetime | None = None,
-) -> int:
-    """Fusiona ``new_rows`` con la partición existente (si la hay) y reescribe."""
+) -> pd.DataFrame:
+    """Fusiona ``new_rows`` con la partición existente (si la hay) y reescribe.
+
+    Nunca elimina contratos: los ids que no vienen en ``new_rows`` se conservan.
+    Devuelve el contenido escrito de la partición.
+    """
     existing = read_partition(store, partition)
     return _apply_merge(store, partition, existing, new_rows, detected_at)
 
@@ -229,9 +234,43 @@ def write_new_partition(
     rows: pd.DataFrame,
     *,
     detected_at: datetime | None = None,
-) -> int:
-    """Escribe una partición desde cero (backfill), fusionando dentro del lote."""
+) -> pd.DataFrame:
+    """Escribe una partición desde cero (sólo tests/partición inexistente)."""
     return _apply_merge(store, partition, None, rows, detected_at)
+
+
+def move_out_ids(
+    store: ObjectStore,
+    partition: str,
+    ids: set[str],
+    *,
+    motivo: str,
+    detected_at: datetime | None = None,
+) -> pd.DataFrame | None:
+    """Saca ``ids`` de ``partition`` guardándolos antes en el historial.
+
+    Se usa cuando una versión más completa del contrato ya quedó escrita en
+    otra partición (``year=unknown`` -> año real). Lee la partición real, así
+    que no depende de que el índice esté al día. Devuelve el contenido escrito,
+    o ``None`` si no había nada que mover.
+    """
+    existing = read_partition(store, partition)
+    if existing is None or not ids or PRIMARY_KEY not in existing.columns:
+        return None
+    leaving = existing[PRIMARY_KEY].isin(ids)
+    if not leaving.any():
+        return None
+    history.append(
+        store,
+        existing[leaving],
+        partition=partition,
+        motivo=motivo,
+        detected_at=detected_at,
+    )
+    remaining = existing[~leaving].reset_index(drop=True)
+    write_partition(store, partition, remaining)
+    logger.info("%s: %d contratos movidos (%s)", partition, int(leaving.sum()), motivo)
+    return remaining
 
 
 def list_partitions(store: ObjectStore) -> list[str]:

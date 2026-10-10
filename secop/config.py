@@ -27,6 +27,8 @@ DATA_FILE = "data.parquet"
 # Versiones reemplazadas de los contratos, particionadas por fecha de detección.
 HISTORY_PREFIX = "raw/contratos_historial"
 STATE_KEY = "state/contratos.json"
+# Índice (id_contrato, partición, ultima_actualizacion): espejo ligero del lake.
+INDEX_KEY = "state/id_index.parquet"
 MANIFEST_KEY = "_manifest.json"
 
 # Primer año con datos utilizables en el dataset.

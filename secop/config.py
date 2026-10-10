@@ -14,6 +14,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # Dataset SECOP II "Contratos Electrónicos" en datos.gov.co (API Socrata).
 DATASET_ID = "jbjy-vk9h"
 SOCRATA_RESOURCE_URL = f"https://www.datos.gov.co/resource/{DATASET_ID}.json"
+SOCRATA_METADATA_URL = f"https://www.datos.gov.co/api/views/{DATASET_ID}.json"
 
 # Clave primaria y columna incremental del dataset (ver memory-bank/datasetContract.md).
 PRIMARY_KEY = "id_contrato"
@@ -22,7 +23,16 @@ PARTITION_DATE_COLUMN = "fecha_de_inicio_del_contrato"
 
 # Prefijos dentro del bucket / directorio de datos.
 LAKE_PREFIX = "raw/contratos"
+# Único archivo por partición (contrato: nunca part-*.parquet).
+DATA_FILE = "data.parquet"
+# Versiones reemplazadas de los contratos, particionadas por fecha de detección.
+HISTORY_PREFIX = "raw/contratos_historial"
 STATE_KEY = "state/contratos.json"
+# Índice (id_contrato, partición, ultima_actualizacion): espejo ligero del lake.
+INDEX_KEY = "state/id_index.parquet"
+# Marca de corrida en curso: si existe al empezar, la anterior se cayó a medias
+# y el índice puede no reflejar el lake (se reconstruye).
+RUN_MARKER_KEY = "state/run_in_progress.json"
 MANIFEST_KEY = "_manifest.json"
 
 # Primer año con datos utilizables en el dataset.
@@ -59,8 +69,8 @@ class Settings(BaseSettings):
     r2_endpoint: str | None = Field(default=None, validation_alias="R2_ENDPOINT")
 
     # --- Local ------------------------------------------------------------------
-    # Raíz del lake local (espejo de la estructura de R2). El histórico heredado
-    # en data/raw/ queda aparte como caché de exploración.
+    # Raíz del lake local (espejo de la estructura de R2). data/raw/ es la caché
+    # del ETL viejo (part-*.parquet sin compactar): no usarla como lake.
     local_data_dir: Path = Field(
         default=REPO_ROOT / "data" / "lake",
         validation_alias="SECOP_LOCAL_DATA_DIR",

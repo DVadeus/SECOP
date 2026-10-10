@@ -8,12 +8,18 @@ from __future__ import annotations
 
 import logging
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from typing import Any
 
+import pandas as pd
 import requests
 
-from secop.config import SOCRATA_RESOURCE_URL, get_settings
+from secop.config import (
+    PRIMARY_KEY,
+    SOCRATA_METADATA_URL,
+    SOCRATA_RESOURCE_URL,
+    get_settings,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +30,9 @@ REQUEST_TIMEOUT = 120
 # Socrata exige un $order determinista para que $offset no salte ni repita filas
 # entre páginas. ":id" es la fila-id interna del dataset, siempre presente.
 STABLE_ORDER = ":id"
+
+# Ids por petición en fetch_by_ids: acota el largo de la URL del "in (...)".
+ID_BATCH_SIZE = 200
 
 
 def _headers() -> dict[str, str]:
@@ -59,8 +68,12 @@ def iter_pages(
     *,
     session: requests.Session | None = None,
     page_size: int | None = None,
+    select: str | None = None,
 ) -> Iterator[list[dict[str, Any]]]:
-    """Itera páginas de registros crudos para una cláusula ``$where`` dada."""
+    """Itera páginas de registros crudos para una cláusula ``$where`` dada.
+
+    ``select`` limita las columnas (``$select``) para descargas ligeras.
+    """
     owns_session = session is None
     session = session or requests.Session()
     size = page_size or get_settings().socrata_page_size
@@ -74,6 +87,8 @@ def iter_pages(
                 "$limit": size,
                 "$offset": offset,
             }
+            if select:
+                params["$select"] = select
             page = _request_with_retry(SOCRATA_RESOURCE_URL, params, session).json()
             if not page:
                 break
@@ -98,4 +113,79 @@ def fetch_data(
     records: list[dict[str, Any]] = []
     for page in iter_pages(where_clause, session=session, page_size=page_size):
         records.extend(page)
+    return records
+
+
+# --------------------------------------------------------------------------- #
+# Foto ligera del origen y descarga dirigida por id                           #
+# --------------------------------------------------------------------------- #
+class SourceReloadedError(RuntimeError):
+    """El origen se recargó durante una descarga paginada (páginas inconsistentes)."""
+
+
+def source_version(session: requests.Session | None = None) -> int | None:
+    """Marca de recarga del dataset (``rowsUpdatedAt`` de la API de metadatos).
+
+    datos.gov.co recarga el dataset completo a diario y ``:id`` cambia: si la
+    marca cambia durante una paginación, el resultado no es fiable.
+    """
+    owns_session = session is None
+    session = session or requests.Session()
+    try:
+        meta = _request_with_retry(SOCRATA_METADATA_URL, {}, session).json()
+    finally:
+        if owns_session:
+            session.close()
+    value = meta.get("rowsUpdatedAt") if isinstance(meta, dict) else None
+    return int(value) if value is not None else None
+
+
+def fetch_snapshot(
+    columns: Sequence[str],
+    *,
+    session: requests.Session | None = None,
+    page_size: int | None = None,
+) -> pd.DataFrame:
+    """Descarga ``columns`` de TODO el dataset (sin filas completas).
+
+    Lanza :class:`SourceReloadedError` si el origen se recargó mientras tanto.
+    """
+    before = source_version(session)
+    frames = [pd.DataFrame(columns=list(columns))]
+    for page in iter_pages(
+        "1=1", session=session, page_size=page_size, select=", ".join(columns)
+    ):
+        frames.append(pd.DataFrame.from_records(page, columns=list(columns)))
+    after = source_version(session)
+    if before != after:
+        raise SourceReloadedError(
+            f"El origen se recargó durante la descarga ({before} -> {after}); "
+            "vuelve a ejecutar."
+        )
+    return pd.concat(frames, ignore_index=True)
+
+
+def _soql_in(column: str, values: Sequence[str]) -> str:
+    quoted = ", ".join("'" + v.replace("'", "''") + "'" for v in values)
+    return f"{column} in ({quoted})"
+
+
+def fetch_by_ids(
+    ids: Sequence[str],
+    *,
+    session: requests.Session | None = None,
+    batch_size: int = ID_BATCH_SIZE,
+) -> list[dict[str, Any]]:
+    """Descarga las filas completas de ``ids`` en lotes de ``batch_size``."""
+    owns_session = session is None
+    session = session or requests.Session()
+    records: list[dict[str, Any]] = []
+    try:
+        for start in range(0, len(ids), batch_size):
+            chunk = ids[start : start + batch_size]
+            records.extend(fetch_data(_soql_in(PRIMARY_KEY, chunk), session=session))
+    finally:
+        if owns_session:
+            session.close()
+    logger.info("Descargados %d registros de %d ids", len(records), len(ids))
     return records

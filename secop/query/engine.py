@@ -9,11 +9,18 @@ from types import TracebackType
 import duckdb
 import pandas as pd
 
-from secop.config import LAKE_PREFIX, Settings, get_settings
+from secop.config import (
+    DATA_FILE,
+    HISTORY_PREFIX,
+    LAKE_PREFIX,
+    Settings,
+    get_settings,
+)
 
 logger = logging.getLogger(__name__)
 
 VIEW_NAME = "contratos"
+HISTORY_VIEW_NAME = "contratos_historial"
 
 
 def _q(value: str) -> str:
@@ -24,20 +31,39 @@ def _q(value: str) -> str:
 class QueryEngine:
     """Abre una conexión DuckDB y expone la vista ``contratos``.
 
+    Si hay historial de versiones, expone además ``contratos_historial``
+    (ver ``has_history``).
+
     Úsese como context manager::
 
         with QueryEngine.from_source("r2") as qe:
             df = qe.run("SELECT count(*) FROM contratos")
     """
 
-    def __init__(self, connection: duckdb.DuckDBPyConnection, glob: str) -> None:
+    def __init__(
+        self,
+        connection: duckdb.DuckDBPyConnection,
+        glob: str,
+        history_glob: str | None = None,
+    ) -> None:
         self._con = connection
         self.glob = glob
+        self.history_glob = history_glob
+        self._create_view(VIEW_NAME, glob)
+        self.has_history = bool(history_glob) and self._glob_has_files(history_glob)
+        if self.has_history and history_glob:
+            self._create_view(HISTORY_VIEW_NAME, history_glob)
+
+    def _create_view(self, name: str, glob: str) -> None:
         self._con.execute(
-            f"CREATE OR REPLACE VIEW {VIEW_NAME} AS "
+            f"CREATE OR REPLACE VIEW {name} AS "
             f"SELECT * FROM read_parquet('{_q(glob)}', "
             f"hive_partitioning => true, union_by_name => true)"
         )
+
+    def _glob_has_files(self, glob: str) -> bool:
+        row = self._con.execute("SELECT count(*) FROM glob(?)", [glob]).fetchone()
+        return bool(row and row[0])
 
     # -- constructores ----------------------------------------------------- #
     @classmethod
@@ -51,18 +77,24 @@ class QueryEngine:
         settings = settings or get_settings()
         con = duckdb.connect(database=":memory:")
         if source == "r2":
-            glob = cls._configure_r2(con, settings)
+            root = cls._configure_r2(con, settings)
+            glob = f"{root}/{LAKE_PREFIX}/year=*/{DATA_FILE}"
+            history_glob = f"{root}/{HISTORY_PREFIX}/detectado=*/{DATA_FILE}"
         elif source == "local":
+            # Sólo el data.parquet compactado de cada "year=..."; así se ignoran
+            # los part-*.parquet y carpetas sin partición Hive del ETL viejo
+            # (p.ej. data/raw/nulls/). Con --path se busca recursivamente.
             base = Path(path) if path else settings.local_data_dir / LAKE_PREFIX
-            # Sólo directorios "year=..."; así se ignora cualquier carpeta
-            # heredada sin partición Hive (p.ej. data/raw/nulls/).
-            glob = f"{base.as_posix().rstrip('/')}/**/year=*/*.parquet"
+            hist = Path(path) if path else settings.local_data_dir / HISTORY_PREFIX
+            glob = f"{base.as_posix().rstrip('/')}/**/year=*/{DATA_FILE}"
+            history_glob = f"{hist.as_posix().rstrip('/')}/**/detectado=*/{DATA_FILE}"
         else:
             raise ValueError(f"source desconocido: {source!r} (usa 'r2' o 'local')")
-        return cls(con, glob)
+        return cls(con, glob, history_glob)
 
     @staticmethod
     def _configure_r2(con: duckdb.DuckDBPyConnection, settings: Settings) -> str:
+        """Configura el acceso a R2 y devuelve la raíz del bucket (r2:// o s3://)."""
         settings.require_r2()
         con.execute("INSTALL httpfs; LOAD httpfs;")
         account = _q(settings.r2_account_id or "")
@@ -73,7 +105,7 @@ class QueryEngine:
                 f"CREATE OR REPLACE SECRET secop_r2 (TYPE r2, "
                 f"ACCOUNT_ID '{account}', KEY_ID '{key}', SECRET '{secret}')"
             )
-            return f"r2://{settings.r2_bucket}/{LAKE_PREFIX}/**/*.parquet"
+            return f"r2://{settings.r2_bucket}"
         except duckdb.Error as exc:  # pragma: no cover - fallback poco común
             logger.warning("SECRET TYPE r2 falló (%s); se usa TYPE s3", exc)
             endpoint = _q((settings.r2_endpoint_url or "").removeprefix("https://"))
@@ -82,7 +114,7 @@ class QueryEngine:
                 f"KEY_ID '{key}', SECRET '{secret}', "
                 f"ENDPOINT '{endpoint}', URL_STYLE 'path', REGION 'auto')"
             )
-            return f"s3://{settings.r2_bucket}/{LAKE_PREFIX}/**/*.parquet"
+            return f"s3://{settings.r2_bucket}"
 
     # -- API -------------------------------------------------------------- #
     def run(self, sql: str, params: list[object] | None = None) -> pd.DataFrame:

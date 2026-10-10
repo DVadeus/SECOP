@@ -67,8 +67,9 @@ R2_BUCKET=secop
 
 ### Carga histórica (una vez, en local)
 
-Descarga fresca desde datos.gov.co, año por año. Es reanudable: si un año ya está en
-R2 se omite (usa `--force` para rehacerlo).
+Descarga desde datos.gov.co, año por año. Es reanudable: si un año ya está en R2 se
+omite (usa `--force` para volver a descargarlo). Siempre **fusiona** con lo que ya hay:
+nunca elimina contratos, aunque el origen ya no los publique.
 
 ```bash
 uv run secop etl backfill --start 2018 --end 2026 --target r2
@@ -77,8 +78,16 @@ uv run secop etl backfill --start 2018 --end 2026 --target r2
 ### Incremental (lo ejecuta GitHub Actions cada semana)
 
 ```bash
-uv run secop etl incremental --lookback-days 2
+uv run secop etl incremental
 ```
+
+`ultima_actualizacion` es nula en ~38 % del origen y datos.gov.co recarga el dataset
+completo a diario, así que no sirve como watermark. El incremental baja una foto ligera
+del origen (`id_contrato`, `ultima_actualizacion`, `fecha_de_inicio_del_contrato`,
+~10 min), la compara con el índice de ids del lake (`state/id_index.parquet`) y
+descarga completos sólo los contratos nuevos, con versión más nueva, o que pasaron de
+`year=unknown` a un año real. Si el origen se recarga durante la foto, la corrida
+aborta sin escribir y se reintenta.
 
 ### Consultar por características
 
@@ -110,6 +119,21 @@ uv run secop sql "SELECT year, count(*) FROM contratos GROUP BY 1 ORDER BY 1"
 uv run secop sql "SELECT * FROM contratos WHERE documento_proveedor = '901261110'" -o foks.xlsx
 ```
 
+### Historial de versiones
+
+Cuando un contrato cambia (llega una versión con otro contenido), el lake principal
+guarda la versión vigente y la anterior se conserva en
+`raw/contratos_historial/detectado=AAAA-MM-DD/data.parquet` con el motivo y la fecha de
+detección. Nunca se borra. Se consulta aparte, para que `secop query` no devuelva
+duplicados:
+
+```bash
+uv run secop historial --nit-proveedor 830125075 -o historial_proveedor.xlsx
+uv run secop historial --nit-entidad 900475780 -o historial_unp.xlsx
+```
+
+En `secop sql` la vista se llama `contratos_historial`.
+
 ### Estado del lake
 
 ```bash
@@ -118,11 +142,16 @@ uv run secop info
 
 ### Sin conexión (Parquet local)
 
-Todos los comandos de consulta aceptan `--source local [--path <dir>]`:
+Todos los comandos de consulta aceptan `--source local [--path <dir>]`. Sin `--path`
+se lee el lake local por defecto, `data/lake/raw/contratos/` (configurable con
+`SECOP_LOCAL_DATA_DIR`), que se llena con `secop etl ... --target local`:
 
 ```bash
-uv run secop query --nit-entidad 900475780 --source local --path data/raw -o unp.xlsx
+uv run secop query --nit-entidad 900475780 --source local -o unp.xlsx
 ```
+
+Sólo se leen los `year=*/data.parquet` compactados. `data/raw/` es la caché del ETL
+viejo (archivos `part-*.parquet` sin deduplicar) y no debe usarse como lake.
 
 ### Notebook
 

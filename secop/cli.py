@@ -6,6 +6,7 @@ Comandos:
 * ``secop etl incremental``  — actualización incremental (la usa GitHub Actions)
 * ``secop query``            — consulta el lake por filtros y exporta a Excel/CSV
 * ``secop sql``              — ejecuta SQL DuckDB crudo contra la vista ``contratos``
+* ``secop historial``        — versiones reemplazadas de contratos, por NIT
 * ``secop info``             — estado del lake (particiones, filas, watermark)
 """
 
@@ -84,16 +85,45 @@ def etl_backfill(
 
 @etl_app.command("incremental")
 def etl_incremental(
-    lookback_days: Annotated[
-        int, typer.Option(help="Días de solapamiento de seguridad sobre el watermark.")
-    ] = 2,
     target: Annotated[str, typer.Option(help="Destino: 'r2' o 'local'.")] = "r2",
 ) -> None:
-    """Descarga y hace upsert de los contratos cambiados desde el watermark."""
+    """Compara el origen con el lake y descarga lo nuevo o cambiado. No borra nada."""
     from secop.pipeline import incremental
 
-    result = incremental(_store(target), lookback_days=lookback_days)
+    result = incremental(_store(target))
     _print_run_result(result)
+
+
+@etl_app.command("reparar")
+def etl_reparar(
+    aplicar: Annotated[
+        bool,
+        typer.Option(help="Aplicar los cambios (por defecto sólo se informa)."),
+    ] = False,
+    target: Annotated[str, typer.Option(help="Destino: 'r2' o 'local'.")] = "r2",
+) -> None:
+    """Saca de year=unknown los contratos que ya están en un año real.
+
+    Corrige lo escrito por versiones anteriores del ETL. Respalda antes en
+    backup/<fecha>/ y las copias movidas quedan en el historial.
+    """
+    from secop.pipeline import repair
+
+    report = repair(_store(target), apply=aplicar)
+    console.print(
+        f"Contratos en year=unknown que ya tienen año: "
+        f"[bold]{report.unknown_with_date:,}[/bold]"
+    )
+    console.print(
+        f"Contratos en dos o más años (evidencia, no se tocan): "
+        f"[bold]{report.year_changes:,}[/bold]"
+    )
+    if not report.applied:
+        console.print("[yellow]Sólo informe. Usa --aplicar para corregir.[/yellow]")
+        return
+    if report.backup_prefix:
+        console.print(f"Respaldo en: {report.backup_prefix}/")
+    _print_run_result(report.result)
 
 
 def _print_run_result(result: object) -> None:
@@ -225,6 +255,56 @@ def sql_cmd(
         console.print(
             f"... {len(df) - limit_preview:,} filas más (usa -o para exportar)"
         )
+
+
+@app.command("historial")
+def historial_cmd(
+    output: Annotated[
+        Path,
+        typer.Option("--output", "-o", help="Archivo de salida (.xlsx/.csv/.parquet)."),
+    ],
+    nit_proveedor: Annotated[
+        list[str] | None,
+        typer.Option("--nit-proveedor", help="NIT del contratista (repetible)."),
+    ] = None,
+    nit_entidad: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--nit-entidad", help="NIT de la entidad contratante (repetible)."
+        ),
+    ] = None,
+    source: Annotated[str, typer.Option(help="Origen: 'r2' o 'local'.")] = "r2",
+    path: Annotated[
+        Path | None, typer.Option(help="Directorio Parquet (con --source local).")
+    ] = None,
+) -> None:
+    """Exporta las versiones anteriores (reemplazadas) de los contratos de un NIT.
+
+    Sale del lake de historial, aparte de ``secop query``, para que la consulta
+    principal nunca devuelva duplicados.
+    """
+    from secop.query import QueryEngine, export_dataframe
+    from secop.query.filters import build_history_query
+
+    try:
+        sql, params = build_history_query(
+            list(nit_proveedor or []), list(nit_entidad or [])
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+    with QueryEngine.from_source(source, path=path) as engine:
+        if not engine.has_history:
+            console.print("[yellow]Aún no hay historial de versiones.[/yellow]")
+            raise typer.Exit(code=1)
+        df = engine.run(sql, params)
+
+    if df.empty:
+        console.print("[yellow]0 versiones. No se escribió ningún archivo.[/yellow]")
+        raise typer.Exit(code=1)
+
+    written = export_dataframe(df, output)
+    console.print(f"[green]{len(df):,} versiones[/green] -> {written}")
 
 
 def _print_dataframe(df: object) -> None:

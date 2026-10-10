@@ -10,10 +10,6 @@ on:
         description: "Re-procesar sólo este año (deja vacío para el incremental normal)"
         required: false
         default: ""
-      lookback_days:
-        description: "Días de solapamiento del incremental"
-        required: false
-        default: "2"
 
 concurrency:
   group: secop-etl
@@ -25,7 +21,8 @@ permissions:
 jobs:
   etl:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # La foto ligera del origen tarda ~10 min; el resto depende de cuánto cambió.
+    timeout-minutes: 120
     env:
       SOCRATA_APP_TOKEN: ${{ secrets.SOCRATA_APP_TOKEN }}
       R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
@@ -45,7 +42,9 @@ jobs:
 
       - name: Incremental
         if: ${{ github.event_name != 'workflow_dispatch' || inputs.year == '' }}
-        run: uv run secop etl incremental --lookback-days "${{ inputs.lookback_days || '2' }}"
+        # Un reintento: el origen se recarga a diario y, si ocurre durante la
+        # foto, la corrida aborta sin escribir nada (es idempotente).
+        run: uv run secop etl incremental || (sleep 900 && uv run secop etl incremental)
 
       - name: Re-procesar un año
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.year != '' }}

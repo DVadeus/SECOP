@@ -11,7 +11,7 @@ import re
 from dataclasses import dataclass, field
 
 from secop.lake import UNKNOWN_YEAR
-from secop.query.engine import VIEW_NAME
+from secop.query.engine import HISTORY_VIEW_NAME, VIEW_NAME
 
 _IDENTIFIER = re.compile(r"^[a-z_][a-z0-9_]*$")
 
@@ -105,4 +105,29 @@ def build_query(spec: QuerySpec) -> tuple[str, list[object]]:
     if spec.limit is not None:
         sql += "\nORDER BY ultima_actualizacion DESC NULLS LAST\nLIMIT ?"
         params.append(spec.limit)
+    return sql, params
+
+
+def build_history_query(
+    nit_proveedor: list[str], nit_entidad: list[str]
+) -> tuple[str, list[object]]:
+    """``(sql, params)`` de ``secop historial``: versiones reemplazadas por NIT.
+
+    Exige al menos un NIT. Si se dan ambos tipos se combinan con OR (todas las
+    versiones en que participa cualquiera de los NIT), ordenadas por contrato y
+    fecha de detección.
+    """
+    if not nit_proveedor and not nit_entidad:
+        raise ValueError("Indica al menos un --nit-proveedor o --nit-entidad")
+    clauses: list[str] = []
+    params: list[object] = []
+    if nit_proveedor:
+        clauses.append(_in_clause("documento_proveedor", nit_proveedor, params))
+    if nit_entidad:
+        clauses.append(_in_clause("nit_entidad", nit_entidad, params))
+    sql = (
+        f"SELECT * FROM {HISTORY_VIEW_NAME}\nWHERE "
+        + " OR ".join(clauses)
+        + "\nORDER BY id_contrato, historial_detectado_utc"
+    )
     return sql, params

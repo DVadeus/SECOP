@@ -11,12 +11,14 @@ from __future__ import annotations
 
 import io
 import logging
+from dataclasses import dataclass
 from datetime import UTC, datetime
 
 import pandas as pd
 
-from secop import schema
+from secop import history, schema
 from secop.config import (
+    DATA_FILE,
     LAKE_PREFIX,
     PARTITION_DATE_COLUMN,
     PRIMARY_KEY,
@@ -46,7 +48,7 @@ def partition_for_year(year: int | None) -> str:
 
 def data_key(partition: str) -> str:
     """Clave del objeto Parquet de una partición."""
-    return f"{LAKE_PREFIX}/{partition}/data.parquet"
+    return f"{LAKE_PREFIX}/{partition}/{DATA_FILE}"
 
 
 def assign_partitions(df: pd.DataFrame) -> pd.Series:
@@ -75,7 +77,14 @@ def _canonicalize_dtypes(df: pd.DataFrame) -> pd.DataFrame:
     for col in schema.NUMERIC_COLUMNS:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce").astype("float64")
-    mapping = {schema.BOOLEAN_TRUE: True, schema.BOOLEAN_FALSE: False}
+    # Acepta tanto "Si"/"No" del origen como True/False ya convertidos (una
+    # columna boolean concatenada con otra ausente puede quedar como object).
+    mapping = {
+        schema.BOOLEAN_TRUE: True,
+        schema.BOOLEAN_FALSE: False,
+        True: True,
+        False: False,
+    }
     for col in schema.BOOLEAN_COLUMNS:
         if col in df.columns and not pd.api.types.is_bool_dtype(df[col]):
             df[col] = df[col].map(mapping).astype("boolean")
@@ -93,6 +102,70 @@ def compact(df: pd.DataFrame) -> pd.DataFrame:
         df = df.sort_values(WATERMARK_COLUMN, na_position="first", kind="stable")
     deduped = df.drop_duplicates(subset=[PRIMARY_KEY], keep="last")
     return deduped.reset_index(drop=True)
+
+
+@dataclass(slots=True)
+class MergeResult:
+    """Resultado de fusionar versiones de contratos en una partición."""
+
+    #: Una fila por ``id_contrato``: la versión vigente.
+    rows: pd.DataFrame
+    #: Versiones perdedoras cuyo contenido difiere de la vigente (van al historial).
+    superseded: pd.DataFrame
+
+
+def merge_versions(
+    existing: pd.DataFrame | None, incoming: pd.DataFrame
+) -> MergeResult:
+    """Fusiona ``incoming`` sobre ``existing`` quedándose con una versión por id.
+
+    Gana la ``ultima_actualizacion`` mayor; en empate (o ambas nulas) gana la
+    más reciente en llegar (``incoming``). Las perdedoras con contenido distinto
+    de la ganadora se devuelven en ``superseded`` para no perderlas.
+    """
+    frames = [
+        _canonicalize_dtypes(f.copy())
+        for f in (existing, incoming)
+        if f is not None and not f.empty
+    ]
+    if not frames:
+        empty = incoming.iloc[0:0]
+        return MergeResult(rows=empty, superseded=empty)
+    combined = pd.concat(frames, ignore_index=True)
+    if PRIMARY_KEY not in combined.columns:
+        return MergeResult(rows=combined, superseded=combined.iloc[0:0])
+
+    if WATERMARK_COLUMN in combined.columns:
+        combined = combined.sort_values(
+            WATERMARK_COLUMN, na_position="first", kind="stable"
+        )
+    winner = ~combined.duplicated(subset=[PRIMARY_KEY], keep="last")
+    superseded = _changed_losers(combined, winner)
+    return MergeResult(
+        rows=combined[winner].reset_index(drop=True),
+        superseded=superseded.reset_index(drop=True),
+    )
+
+
+def _changed_losers(combined: pd.DataFrame, winner: pd.Series) -> pd.DataFrame:
+    """Perdedoras cuyo contenido difiere del de la ganadora de su mismo id."""
+    if winner.all():
+        return combined.iloc[0:0]
+    # Sólo se hashean los ids con más de una versión (evita hashear la
+    # partición entera en cada upsert).
+    contested = combined[combined[PRIMARY_KEY].duplicated(keep=False)]
+    hashes = history.content_hash(contested)
+    is_winner = winner.loc[contested.index]
+    winner_hash = pd.Series(
+        hashes[is_winner].to_numpy(),
+        index=contested.loc[is_winner, PRIMARY_KEY].to_numpy(),
+    )
+    losers = contested[~is_winner]
+    loser_hash = hashes[~is_winner]
+    differs = loser_hash.to_numpy() != losers[PRIMARY_KEY].map(winner_hash).to_numpy()
+    changed = losers[differs]
+    # Varias perdedoras idénticas entre sí sólo cuentan una vez.
+    return changed[~loser_hash[differs].duplicated().to_numpy()]
 
 
 def _to_parquet_bytes(df: pd.DataFrame) -> bytes:
@@ -118,19 +191,86 @@ def write_partition(store: ObjectStore, partition: str, df: pd.DataFrame) -> int
     return len(df)
 
 
-def upsert_partition(store: ObjectStore, partition: str, new_rows: pd.DataFrame) -> int:
-    """Fusiona ``new_rows`` con la partición existente (si la hay) y reescribe."""
+def _apply_merge(
+    store: ObjectStore,
+    partition: str,
+    existing: pd.DataFrame | None,
+    incoming: pd.DataFrame,
+    detected_at: datetime | None,
+) -> pd.DataFrame:
+    result = merge_versions(existing, incoming)
+    # Historial ANTES que la partición: si la escritura de la partición falla,
+    # la versión reemplazada ya está a salvo (y append es idempotente).
+    history.append(
+        store,
+        result.superseded,
+        partition=partition,
+        motivo=history.MOTIVO_VERSION,
+        detected_at=detected_at,
+    )
+    write_partition(store, partition, result.rows)
+    return result.rows
+
+
+def upsert_partition(
+    store: ObjectStore,
+    partition: str,
+    new_rows: pd.DataFrame,
+    *,
+    detected_at: datetime | None = None,
+) -> pd.DataFrame:
+    """Fusiona ``new_rows`` con la partición existente (si la hay) y reescribe.
+
+    Nunca elimina contratos: los ids que no vienen en ``new_rows`` se conservan.
+    Devuelve el contenido escrito de la partición.
+    """
     existing = read_partition(store, partition)
-    if existing is None:
-        combined = new_rows
-    else:
-        combined = pd.concat([existing, new_rows], ignore_index=True)
-    return write_partition(store, partition, compact(combined))
+    return _apply_merge(store, partition, existing, new_rows, detected_at)
 
 
-def write_new_partition(store: ObjectStore, partition: str, rows: pd.DataFrame) -> int:
-    """Escribe una partición desde cero (backfill), compactando dentro del lote."""
-    return write_partition(store, partition, compact(rows.copy()))
+def write_new_partition(
+    store: ObjectStore,
+    partition: str,
+    rows: pd.DataFrame,
+    *,
+    detected_at: datetime | None = None,
+) -> pd.DataFrame:
+    """Escribe una partición desde cero (sólo tests/partición inexistente)."""
+    return _apply_merge(store, partition, None, rows, detected_at)
+
+
+def move_out_ids(
+    store: ObjectStore,
+    partition: str,
+    ids: set[str],
+    *,
+    motivo: str,
+    detected_at: datetime | None = None,
+) -> pd.DataFrame | None:
+    """Saca ``ids`` de ``partition`` guardándolos antes en el historial.
+
+    Se usa cuando una versión más completa del contrato ya quedó escrita en
+    otra partición (``year=unknown`` -> año real). Lee la partición real, así
+    que no depende de que el índice esté al día. Devuelve el contenido escrito,
+    o ``None`` si no había nada que mover.
+    """
+    existing = read_partition(store, partition)
+    if existing is None or not ids or PRIMARY_KEY not in existing.columns:
+        return None
+    leaving = existing[PRIMARY_KEY].isin(ids)
+    if not leaving.any():
+        return None
+    history.append(
+        store,
+        existing[leaving],
+        partition=partition,
+        motivo=motivo,
+        detected_at=detected_at,
+    )
+    remaining = existing[~leaving].reset_index(drop=True)
+    write_partition(store, partition, remaining)
+    logger.info("%s: %d contratos movidos (%s)", partition, int(leaving.sum()), motivo)
+    return remaining
 
 
 def list_partitions(store: ObjectStore) -> list[str]:
@@ -139,6 +279,6 @@ def list_partitions(store: ObjectStore) -> list[str]:
     parts = {
         key[len(prefix) :].split("/", 1)[0]
         for key in store.list_keys(prefix)
-        if key.endswith("data.parquet")
+        if key.endswith(f"/{DATA_FILE}")
     }
     return sorted(parts)

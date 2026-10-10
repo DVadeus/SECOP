@@ -79,3 +79,55 @@ def test_raises_after_max_retries(monkeypatch: pytest.MonkeyPatch) -> None:
 
     with pytest.raises(requests.RequestException):
         extract.fetch_data("1=1", session=session, page_size=10)  # type: ignore[arg-type]
+
+
+# --------------------------------------------------------------------------- #
+# Foto ligera, recarga del origen y descarga por id                           #
+# --------------------------------------------------------------------------- #
+class _RoutingSession:
+    """Responde metadatos y datos por URL; registra los parámetros enviados."""
+
+    def __init__(self, versions: list[int], pages: list[list[dict[str, Any]]]) -> None:
+        self._versions = iter(versions)
+        self._pages = iter(pages)
+        self.data_calls: list[dict[str, Any]] = []
+
+    def get(self, url: str, headers=None, params=None, timeout=None) -> Any:  # noqa: ANN001
+        if url.startswith("https://www.datos.gov.co/api/views/"):
+            return _FakeResponse({"rowsUpdatedAt": next(self._versions)})  # type: ignore[arg-type]
+        self.data_calls.append(dict(params or {}))
+        return _FakeResponse(next(self._pages, []))
+
+    def close(self) -> None:  # pragma: no cover
+        pass
+
+
+def test_iter_pages_sends_select() -> None:
+    session = _FakeSession([[{"i": 1}]])
+    list(extract.iter_pages("1=1", session=session, page_size=10, select="a, b"))  # type: ignore[arg-type]
+    assert session.calls[0]["$select"] == "a, b"
+
+
+def test_fetch_snapshot_returns_requested_columns() -> None:
+    session = _RoutingSession(
+        versions=[7, 7],
+        pages=[[{"id_contrato": "A"}, {"id_contrato": "B", "x": "1"}]],
+    )
+    snap = extract.fetch_snapshot(["id_contrato", "x"], session=session, page_size=5)  # type: ignore[arg-type]
+    assert snap.columns.tolist() == ["id_contrato", "x"]
+    assert snap["id_contrato"].tolist() == ["A", "B"]
+    assert session.data_calls[0]["$select"] == "id_contrato, x"
+
+
+def test_fetch_snapshot_detects_source_reload() -> None:
+    session = _RoutingSession(versions=[1, 2], pages=[[{"id_contrato": "A"}]])
+    with pytest.raises(extract.SourceReloadedError):
+        extract.fetch_snapshot(["id_contrato"], session=session, page_size=5)  # type: ignore[arg-type]
+
+
+def test_fetch_by_ids_batches_and_escapes_quotes() -> None:
+    session = _FakeSession([[{"id_contrato": "A"}], [{"id_contrato": "O'B"}]])
+    rows = extract.fetch_by_ids(["A", "O'B"], session=session, batch_size=1)  # type: ignore[arg-type]
+    assert [r["id_contrato"] for r in rows] == ["A", "O'B"]
+    assert session.calls[0]["$where"] == "id_contrato in ('A')"
+    assert session.calls[1]["$where"] == "id_contrato in ('O''B')"

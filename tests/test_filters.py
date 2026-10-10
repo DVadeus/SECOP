@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import pytest
 
-from secop.query.filters import InvalidColumnError, QuerySpec, build_query
+from secop.query.filters import (
+    InvalidColumnError,
+    QuerySpec,
+    build_history_query,
+    build_query,
+)
 
 
 def test_no_filters_selects_all() -> None:
@@ -71,3 +76,16 @@ def test_injection_attempt_in_value_stays_a_param() -> None:
     sql, params = build_query(QuerySpec(nit_proveedor=["' OR 1=1 --"]))
     assert "' OR 1=1" not in sql
     assert params == ["' OR 1=1 --"]
+
+
+def test_history_query_requires_a_nit() -> None:
+    with pytest.raises(ValueError):
+        build_history_query([], [])
+
+
+def test_history_query_combines_nits_with_or() -> None:
+    sql, params = build_history_query(["11"], ["800"])
+    assert "FROM contratos_historial" in sql
+    assert "documento_proveedor IN (?) OR nit_entidad IN (?)" in sql
+    assert sql.rstrip().endswith("ORDER BY id_contrato, historial_detectado_utc")
+    assert params == ["11", "800"]

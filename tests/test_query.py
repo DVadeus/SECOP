@@ -128,3 +128,39 @@ def test_export_excel_falls_back_to_csv_when_too_many_rows(
     assert written.suffix == ".csv"
     assert written.exists()
     _ = EXCEL_MAX_ROWS  # referenciado para el import
+
+
+def test_engine_ignores_legacy_part_files(seeded_lake: Path) -> None:
+    """Sólo cuenta el data.parquet compactado; los part-* del ETL viejo no."""
+    legacy = seeded_lake / "raw" / "contratos" / "year=2024" / "part-abc.parquet"
+    pd.DataFrame({"id_contrato": ["A", "A"]}).to_parquet(legacy)
+    with QueryEngine.from_source("local", path=seeded_lake) as qe:
+        assert qe.count() == 4
+
+
+def test_history_view_is_separate_from_main_view(seeded_lake: Path) -> None:
+    from secop.query.filters import build_history_query
+
+    store = LocalStore(seeded_lake)
+    with QueryEngine.from_source("local", path=seeded_lake) as qe:
+        assert not qe.has_history
+
+    update = pd.DataFrame(
+        {
+            "id_contrato": ["A"],
+            "nit_entidad": ["800"],
+            "documento_proveedor": ["11"],
+            "ultima_actualizacion": pd.to_datetime(["2026-09-01"]),
+            "fecha_de_inicio_del_contrato": pd.to_datetime(["2024-01-01"]),
+            "valor_del_contrato": [999.0],
+        }
+    )
+    lake.upsert_partition(store, "year=2024", update)
+
+    sql, params = build_history_query(["11"], [])
+    with QueryEngine.from_source("local", path=seeded_lake) as qe:
+        assert qe.has_history
+        assert qe.count() == 4  # la consulta principal no se duplica
+        hist = qe.run(sql, params)
+    assert hist["valor_del_contrato"].tolist() == [100.0]
+    assert hist["historial_motivo"].tolist() == ["version_reemplazada"]

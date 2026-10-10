@@ -144,7 +144,34 @@ def test_incremental_without_changes_writes_no_partition(
     _fake_source(monkeypatch, [rec])
     result = pipeline.incremental(store)
     assert result.partitions == {}
-    assert result.rows_written == 0
+    assert result.contracts_written == 0
+
+
+def test_run_result_counts_contracts_not_partition_sizes(
+    store: LocalStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Varios lotes sobre una misma partición no deben sumar su tamaño cada vez."""
+    _seed(
+        store,
+        "year=2026",
+        [
+            _rec(f"OLD{n}", "2026-01-01T00:00:00", "2026-01-01T00:00:00")
+            for n in range(5)
+        ],
+    )
+    _fake_source(
+        monkeypatch,
+        [
+            _rec(f"NEW{n}", "2026-02-01T00:00:00", "2026-09-01T00:00:00")
+            for n in range(3)
+        ],
+    )
+    monkeypatch.setattr(pipeline, "FETCH_CHUNK_IDS", 1)  # 3 lotes
+
+    result = pipeline.incremental(store)
+
+    assert result.contracts_written == 3
+    assert result.partitions == {"year=2026": 8}  # tamaño final, no 6 + 7 + 8
 
 
 def test_state_watermark_is_informative_maximum(
@@ -262,3 +289,43 @@ def test_repair_reports_then_moves_unknown_copies(store: LocalStore) -> None:
     }
     assert _history(store)["id_contrato"].tolist() == ["A"]
     assert pipeline.repair(store).unknown_with_date == 0
+
+
+def _year_change_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        r.getMessage() for r in caplog.records if "cambiaron de año" in r.getMessage()
+    ]
+
+
+def test_year_change_warning_ignores_known_two_year_contracts(
+    store: LocalStore,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Caso real: CO1.PCCNTR.7395172 ya estaba en 2025 y 2026; sólo cambió en 2026."""
+    _seed(store, "year=2025", [_rec("K", "2025-06-01T00:00:00")])
+    _seed(store, "year=2026", [_rec("K", "2026-01-01T00:00:00", "2026-09-01T00:00:00")])
+    _fake_source(monkeypatch, [_rec("K", "2026-01-01T00:00:00", "2026-10-05T00:00:00")])
+
+    with caplog.at_level("WARNING", logger="secop.pipeline"):
+        result = pipeline.incremental(store)
+
+    assert result.contracts_written == 1
+    assert _year_change_warnings(caplog) == []
+
+
+def test_year_change_warning_reports_new_changes(
+    store: LocalStore,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _seed(store, "year=2025", [_rec("M", "2025-06-01T00:00:00")])
+    _fake_source(monkeypatch, [_rec("M", "2026-01-01T00:00:00", "2026-10-05T00:00:00")])
+
+    with caplog.at_level("WARNING", logger="secop.pipeline"):
+        pipeline.incremental(store)
+
+    warnings = _year_change_warnings(caplog)
+    assert len(warnings) == 1
+    assert warnings[0].startswith("1 contratos") and "M" in warnings[0]
+    assert _ids(store) == {"year=2025": ["M"], "year=2026": ["M"]}

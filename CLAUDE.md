@@ -1,7 +1,7 @@
 # CLAUDE.md
 
 Guía para trabajar en este repositorio y registro del análisis del código.
-Última revisión: 2026-10-10 (rama `fix/integridad-lake`).
+Última revisión: 2026-10-10 (rama `fix/reporte-incremental`).
 
 ## Qué es
 
@@ -34,7 +34,7 @@ uv run secop sql "SELECT year, count(*) FROM contratos GROUP BY 1" [-o out.csv]
 uv run secop info [--source local]
 ```
 
-Estado: 78 tests pasan, ruff y basedpyright sin errores.
+Estado: 84 tests pasan, ruff y basedpyright sin errores.
 
 ## Arquitectura
 
@@ -107,20 +107,40 @@ Detalle en `memory-bank/datasetContract.md` e `incrementalStrategy.md`.
 
 ## Hallazgos del análisis y estado
 
-Auditoría de R2 vs origen (2026-10-09/10, sólo lectura):
+Auditoría de R2 vs origen (2026-10-09, sólo lectura) y estado tras la limpieza del
+2026-10-10:
 
 | Hallazgo | Medida | Estado |
 |---|---|---|
 | Origen se recarga a diario; `:updated_at`/`:id` inútiles | todas las filas con el mismo `:updated_at` | Diseño: foto + índice |
 | `ultima_actualizacion` nula en el origen | 2.139.277 de 5.621.358 (38 %) | Etapa 5–6 |
-| Contratos del origen ausentes en R2 (nuevos sin `ua`) | 95.467 | Etapa 5; se cargan en el próximo incremental |
-| `unknown` en R2 que ya tienen fecha en el origen | 30.869 | Etapa 5; próximo incremental |
-| Ids en `unknown` y además en un año real | 1.916 | Etapa 3 + `etl reparar` |
+| Contratos del origen ausentes en R2 (nuevos sin `ua`) | 95.467 | Cargados (incremental 2026-10-10) |
+| `unknown` en R2 que ya tienen fecha en el origen | 30.869 | Movidos a su año (incremental 2026-10-10) |
+| Ids en `unknown` y además en un año real | 1.916 | Movidos al historial (`etl reparar --aplicar`) |
 | Ids en dos años reales | 10 | Se conservan (evidencia) |
 | Ids en R2 que ya no están en el origen | 491.931 (sobre todo Borrador/Cancelado) | Se conservan (decisión) |
 | Ids duplicados dentro del propio origen | 298 | `merge_versions` |
 
-Defectos del código y etapa que los corrigió (commits en `fix/integridad-lake`):
+Limpieza de R2 (2026-10-10, tras integrar el PR #1):
+
+1. Respaldo completo (copia en el servidor, verificada por tamaño y ETag) en
+   `backup/20261010T062725Z/`: estado del 2026-10-05, 23 objetos, 2,12 GB. `etl
+   reparar` dejó además `backup/20261010T063107Z/` (unknown, estado, manifest). Se
+   conservan hasta que el usuario decida borrarlos.
+2. `secop etl reparar --aplicar`: 1.916 copias de `unknown` al historial.
+3. `secop etl incremental`: 139.938 ids descargados; 13.602 versiones reemplazadas al
+   historial.
+4. Auditoría final contra una foto nueva del origen: 0 contratos faltantes, 0 ids en
+   `unknown` y en un año real, 0 pendientes; índice, manifest y `row_counts`
+   coinciden con el lake (6.113.001 filas). Historial: 32.785 `fecha_completada` y
+   13.602 `version_reemplazada`.
+
+GitHub Actions: el workflow corrió con éxito todos los lunes desde 2026-09-07 (5
+corridas), pero con el código viejo; los datos faltantes eran un límite del diseño, no
+un fallo de ejecución. El cron (06:00 UTC) arranca con 5–7 h de retraso por la carga
+de GitHub.
+
+Defectos del código y etapa que los corrigió (commits del PR #1, `fix/integridad-lake`):
 
 1. Lake local / glob leía `part-*` del ETL viejo; README y notebook usaban `data/raw` →
    **Etapa 1**.
@@ -135,6 +155,11 @@ Defectos del código y etapa que los corrigió (commits en `fix/integridad-lake`
 7. Costo: `unknown` (136 MB) se leía en cada lote → **Etapa 7** (índice fiable con
    marca de corrida).
 8. Datos ya escritos en R2 → **Etapa 8** (`etl reparar`).
+9. El resumen de la corrida sumaba el tamaño total de cada partición en cada lote
+   (reportó 8.812.912 "filas escritas" sobre un lake de 6,1 M) → `contracts_written`
+   cuenta los contratos aplicados (rama `fix/reporte-incremental`).
+10. El aviso de cambio de año saltaba también con contratos ya conocidos en dos años →
+    sólo avisa de cambios nuevos (rama `fix/reporte-incremental`).
 
 Pendientes / limitaciones conocidas:
 

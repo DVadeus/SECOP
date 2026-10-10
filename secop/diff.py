@@ -2,8 +2,10 @@
 
 ``ultima_actualizacion`` es nula en ~38 % del origen, así que no basta para
 detectar novedades. Aquí se decide qué ``id_contrato`` hay que descargar
-completos comparando, para cada fila del origen, su partición destino con lo
-que el índice dice que ya hay en el lake.
+completos comparando, para cada fila del origen, su partición destino y su
+versión con lo que el índice dice que ya hay en el lake. No hay watermark
+global: cada id se compara con su propia versión, así que ningún cambio se
+pierde por un watermark adelantado (p.ej. tras un backfill reanudado).
 """
 
 from __future__ import annotations
@@ -34,13 +36,16 @@ def _prepare_snapshot(snapshot: pd.DataFrame) -> pd.DataFrame:
     return out.dropna(subset=[PRIMARY_KEY])
 
 
-# Ids del origen que no están en su partición destino.
+# Ids del origen que hay que descargar:
 #
-# * id nuevo, unknown -> año real, cambio de año: siempre.
+# * no está en su partición destino (id nuevo, unknown -> año real, cambio de
+#   año): siempre;
 # * destino unknown pero el lake ya lo tiene con fecha (el origen borró la
 #   fecha): sólo si trae una ultima_actualizacion más nueva que la del lake;
-#   si no, ya se registró en el historial y no hay nada nuevo que bajar.
-_MISSING_SQL = f"""
+#   si no, ya se registró en el historial y no hay nada nuevo que bajar;
+# * ya está en su partición pero el origen trae una ultima_actualizacion más
+#   nueva (o el lake la tiene nula).
+_FETCH_SQL = f"""
 WITH missing AS (
     SELECT s.{PRIMARY_KEY}, s.target, s.ua
     FROM snap s
@@ -52,13 +57,23 @@ dated AS (
     FROM idx
     WHERE {COL_PARTITION} <> '{lake.UNKNOWN_PARTITION}'
     GROUP BY 1
+),
+updated AS (
+    SELECT s.{PRIMARY_KEY}
+    FROM snap s
+    JOIN idx i
+      ON s.{PRIMARY_KEY} = i.{PRIMARY_KEY} AND s.target = i.{COL_PARTITION}
+    WHERE s.ua IS NOT NULL
+      AND (i.{WATERMARK_COLUMN} IS NULL OR s.ua > i.{WATERMARK_COLUMN})
 )
-SELECT DISTINCT m.{PRIMARY_KEY}
+SELECT m.{PRIMARY_KEY}
 FROM missing m
 LEFT JOIN dated d USING ({PRIMARY_KEY})
 WHERE m.target <> '{lake.UNKNOWN_PARTITION}'
    OR d.{PRIMARY_KEY} IS NULL
    OR (m.ua IS NOT NULL AND (d.ua_max IS NULL OR m.ua > d.ua_max))
+UNION
+SELECT {PRIMARY_KEY} FROM updated
 ORDER BY 1
 """
 
@@ -70,12 +85,13 @@ def ids_to_fetch(snapshot: pd.DataFrame, idx: pd.DataFrame) -> list[str]:
     try:
         con.register("snap", snap)
         con.register("idx", idx)
-        rows = con.execute(_MISSING_SQL).fetchall()
+        rows = con.execute(_FETCH_SQL).fetchall()
     finally:
         con.close()
     ids = [str(r[0]) for r in rows]
     logger.info(
-        "Foto del origen: %d filas; %d ids nuevos o fuera de su partición",
+        "Foto del origen: %d filas; %d ids nuevos, actualizados o fuera de "
+        "su partición",
         len(snap),
         len(ids),
     )

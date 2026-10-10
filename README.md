@@ -67,8 +67,9 @@ R2_BUCKET=secop
 
 ### Carga histórica (una vez, en local)
 
-Descarga fresca desde datos.gov.co, año por año. Es reanudable: si un año ya está en
-R2 se omite (usa `--force` para rehacerlo).
+Descarga desde datos.gov.co, año por año. Es reanudable: si un año ya está en R2 se
+omite (usa `--force` para volver a descargarlo). Siempre **fusiona** con lo que ya hay:
+nunca elimina contratos, aunque el origen ya no los publique.
 
 ```bash
 uv run secop etl backfill --start 2018 --end 2026 --target r2
@@ -77,8 +78,16 @@ uv run secop etl backfill --start 2018 --end 2026 --target r2
 ### Incremental (lo ejecuta GitHub Actions cada semana)
 
 ```bash
-uv run secop etl incremental --lookback-days 2
+uv run secop etl incremental
 ```
+
+`ultima_actualizacion` es nula en ~38 % del origen y datos.gov.co recarga el dataset
+completo a diario, así que no sirve como watermark. El incremental baja una foto ligera
+del origen (`id_contrato`, `ultima_actualizacion`, `fecha_de_inicio_del_contrato`,
+~10 min), la compara con el índice de ids del lake (`state/id_index.parquet`) y
+descarga completos sólo los contratos nuevos, con versión más nueva, o que pasaron de
+`year=unknown` a un año real. Si el origen se recarga durante la foto, la corrida
+aborta sin escribir y se reintenta.
 
 ### Consultar por características
 

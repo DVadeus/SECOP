@@ -85,15 +85,12 @@ def etl_backfill(
 
 @etl_app.command("incremental")
 def etl_incremental(
-    lookback_days: Annotated[
-        int, typer.Option(help="Días de solapamiento de seguridad sobre el watermark.")
-    ] = 2,
     target: Annotated[str, typer.Option(help="Destino: 'r2' o 'local'.")] = "r2",
 ) -> None:
-    """Descarga y hace upsert de los contratos cambiados desde el watermark."""
+    """Compara el origen con el lake y descarga lo nuevo o cambiado. No borra nada."""
     from secop.pipeline import incremental
 
-    result = incremental(_store(target), lookback_days=lookback_days)
+    result = incremental(_store(target))
     _print_run_result(result)
 
 

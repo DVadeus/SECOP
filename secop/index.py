@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import io
 import logging
+from datetime import UTC, datetime
 
 import pandas as pd
 import pyarrow.parquet as pq
@@ -77,6 +78,14 @@ def row_counts(index: pd.DataFrame) -> dict[str, int]:
     """Filas por partición de TODO el lake (no sólo lo tocado en la corrida)."""
     counts = index.groupby(COL_PARTITION).size()
     return {str(p): int(n) for p, n in sorted(counts.items())}
+
+
+def max_watermark(index: pd.DataFrame) -> datetime | None:
+    """Mayor ``ultima_actualizacion`` presente en el lake (informativo)."""
+    top = index[WATERMARK_COLUMN].max() if not index.empty else pd.NaT
+    if pd.isna(top):
+        return None
+    return pd.Timestamp(top).to_pydatetime().replace(tzinfo=UTC)
 
 
 def load(store: ObjectStore) -> pd.DataFrame | None:

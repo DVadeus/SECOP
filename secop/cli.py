@@ -106,13 +106,14 @@ def etl_backfill(
     """
     from secop.pipeline import backfill
 
+    chosen = _base(base)  # antes que el store: una base inválida no toca nada
     result = backfill(
         _store(target),
         start_year=start,
         end_year=end,
         force=force,
         only_year=year,
-        base=_base(base),
+        base=chosen,
     )
     _print_run_result(result)
 
@@ -127,7 +128,8 @@ def etl_incremental(
     """Compara el origen con el lake y descarga lo nuevo o cambiado. No borra nada."""
     from secop.pipeline import incremental
 
-    result = incremental(_store(target), _base(base))
+    chosen = _base(base)  # antes que el store: una base inválida no toca nada
+    result = incremental(_store(target), chosen)
     _print_run_result(result)
 
 
@@ -149,7 +151,8 @@ def etl_reparar(
     """
     from secop.pipeline import repair
 
-    report = repair(_store(target), apply=aplicar, base=_base(base))
+    chosen = _base(base)  # antes que el store: una base inválida no toca nada
+    report = repair(_store(target), apply=aplicar, base=chosen)
     console.print(
         f"Contratos en year=unknown que ya tienen año: "
         f"[bold]{report.unknown_with_date:,}[/bold]"

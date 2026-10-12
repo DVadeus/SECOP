@@ -30,6 +30,9 @@ _SOCRATA = "https://www.datos.gov.co"
 
 #: Foto ligera del origen + índice de ids (``secop.diff``).
 STRATEGY_SNAPSHOT_DIFF = "snapshot_diff"
+#: Bajar el dataset completo en cada corrida (datasets pequeños sin columna de
+#: versión); el hash de contenido decide qué cambió.
+STRATEGY_FULL_REFRESH = "full_refresh"
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,6 +69,9 @@ class Base:
     partition_date_column: str
     schema: SchemaSpec
     strategy: str = STRATEGY_SNAPSHOT_DIFF
+    #: Un contrato puede tener varias filas (p.ej. una por parte o por origen de
+    #: recursos): la unidad de versión y de partición es el contrato completo.
+    grouped: bool = False
     #: Pares (columna propia, columna equivalente de la base de contratos).
     column_pairs: tuple[tuple[str, str], ...] = ()
 
@@ -111,7 +117,80 @@ CONTRATOS = Base(
     ),
 )
 
-BASES: dict[str, Base] = {b.name: b for b in (CONTRATOS,)}
+#: Convenios interadministrativos SECOP I y II (``s484-c9k3``). Comparte las
+#: carpetas ``year=*`` con contratos, con su propio archivo. Sin columna de
+#: versión y con varias filas por contrato en SECOP I (una por parte o por
+#: ``origen_de_los_recursos``): se baja completo y se versiona por contrato.
+INTERADMINISTRATIVOS = Base(
+    name="interadministrativos",
+    dataset_id="s484-c9k3",
+    data_file="interadministrativos.parquet",
+    lake_prefix=LAKE_PREFIX,
+    history_prefix=HISTORY_PREFIX,
+    state_key="state/interadministrativos.json",
+    index_key="state/interadministrativos_id_index.parquet",
+    manifest_key="_manifest_interadministrativos.json",
+    run_marker_key="state/interadministrativos_run_in_progress.json",
+    key=PRIMARY_KEY,
+    version_column=None,
+    partition_date_column="fecha_inicio_del_contrato",
+    schema=SchemaSpec(
+        date_columns=(
+            "fecha_cargue",
+            "fecha_firma",
+            "fecha_inicio_del_contrato",
+            "fecha_fin_del_contrato",
+        ),
+        numeric_columns=("valor_con_adiciones", "anno_cargue", "anno_firma"),
+        categorical_columns=(
+            "orden",
+            "departamento",
+            "municipio",
+            "modalidad_contratacion",
+            "tipo_de_contrato",
+            "justificacion_modalidad",
+            "estado_contrato",
+            "fuente",
+            "tipo_contratista",
+            "origen_de_los_recursos",
+        ),
+        url_struct_columns=("link",),
+    ),
+    strategy=STRATEGY_FULL_REFRESH,
+    grouped=True,
+    # Equivalencias medidas en los 53.445 convenios presentes en ambas bases
+    # (2026-10-12). unspsc_id_clase NO se mapea: en SECOP I es el nombre de la
+    # clase, no el código de codigo_de_categoria_principal.
+    column_pairs=(
+        # Identificadores (100 %).
+        ("id_contrato", "id_contrato"),
+        ("id_proceso", "proceso_de_compra"),
+        ("numero_de_contrato", "referencia_del_contrato"),
+        ("link", "urlproceso"),
+        ("id_entidad", "codigo_entidad"),
+        ("identificacion_contratista", "documento_proveedor"),
+        # Mismo dato (98,8-100 %).
+        ("nombre_entidad", "nombre_entidad"),
+        ("orden", "orden"),
+        ("departamento", "departamento"),
+        ("municipio", "ciudad"),
+        ("contratista", "proveedor_adjudicado"),
+        ("modalidad_contratacion", "modalidad_de_contratacion"),
+        ("tipo_de_contrato", "tipo_de_contrato"),
+        ("justificacion_modalidad", "justificacion_modalidad_de"),
+        ("estado_contrato", "estado_contrato"),
+        ("origen_de_los_recursos", "origen_de_los_recursos"),
+        ("objeto_contractual", "objeto_del_contrato"),
+        ("valor_con_adiciones", "valor_del_contrato"),
+        ("fecha_firma", "fecha_de_firma"),
+        ("fecha_inicio_del_contrato", "fecha_de_inicio_del_contrato"),
+        ("fecha_fin_del_contrato", "fecha_de_fin_del_contrato"),
+        # Mismo concepto, otro vocabulario: se funde con su valor original.
+        ("tipo_contratista", "tipodocproveedor"),
+    ),
+)
+
+BASES: dict[str, Base] = {b.name: b for b in (CONTRATOS, INTERADMINISTRATIVOS)}
 
 
 def get_base(name: str) -> Base:

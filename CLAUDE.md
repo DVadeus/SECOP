@@ -1,7 +1,7 @@
 # CLAUDE.md
 
 Guía para trabajar en este repositorio y registro del análisis del código.
-Última revisión: 2026-10-12 (rama `feat/base-interadministrativos`).
+Última revisión: 2026-10-12 (rama `feat/vista-combinada`).
 
 ## Qué es
 
@@ -30,18 +30,20 @@ uv run pytest                             # excluye tests marcados 'integration'
 uv run ruff check . && uv run ruff format --check .
 uv run basedpyright secop                 # modo "standard"
 
-# Todos aceptan --base contratos|interadministrativos (por defecto contratos)
+# Todos aceptan --base contratos|interadministrativos (por defecto contratos);
+# query e info también --base todas (vista combinada contratos_todos)
 uv run secop etl backfill --start 2018 --end 2026 --target r2 [--year Y --force]
 uv run secop etl incremental [--target local] [--base interadministrativos]
 uv run secop etl reparar [--aplicar]      # sin --aplicar sólo informa
 uv run secop query --nit-entidad 900475780 --year-from 2024 -o out.xlsx [--source local --path DIR]
 uv run secop query --base interadministrativos --plataforma SECOP_I -o conv.xlsx
+uv run secop query --base todas --nit-entidad 900475780 --solo-interadministrativos -o unp.xlsx
 uv run secop historial --nit-proveedor 830125075 -o versiones.xlsx
 uv run secop sql "SELECT year, count(*) FROM contratos GROUP BY 1" [-o out.csv]
 uv run secop info [--source local]
 ```
 
-Estado: 115 tests pasan, ruff y basedpyright sin errores.
+Estado: 129 tests pasan, ruff y basedpyright sin errores.
 
 ## Arquitectura
 
@@ -69,7 +71,7 @@ Socrata ─► foto ligera (id, ua, fecha_inicio) ─► diff vs índice ─► 
 | `secop/pipeline.py` | `_apply_batch` aplica las reglas entre particiones. `backfill()` (por año, reanudable, siempre fusiona), `incremental()` (foto → diff → fetch por lotes de 50.000 ids), `repair()` (saca de `unknown` los ids que ya están con fecha, con respaldo). Bases `full_refresh`: `_full_refresh` (baja todo y fusiona por contenido; `backfill` ignora años). `_begin`/`_finish` gestionan la marca, índice, estado y manifest de cada base. |
 | `secop/state.py` | `PipelineState` en `state/contratos.json`. `ultima_actualizacion` es **informativo** (máximo del índice); la extracción no depende de él. |
 | `secop/storage/` | Protocolo `ObjectStore` y `R2Store` (boto3) / `LocalStore` (escritura atómica). |
-| `secop/query/` | `QueryEngine`: una vista por base (`contratos`, `interadministrativos`, glob `year=*/<data_file>`) y su `*_historial`, sólo si hay archivos (`has_view`/`require_view`). `filters.build_query(spec, base)` / `build_history_query`: filtros con nombres de contratos traducidos con `column_map` (`UnsupportedFilterError` si no hay columna); `--nit-entidad` en interadministrativos vía `codigo_entidad` de contratos (sólo SECOP II); `plataforma`. Exportador por extensión. |
+| `secop/query/` | `QueryEngine`: una vista por base (`contratos`, `interadministrativos`, glob `year=*/<data_file>`) y su `*_historial`, sólo si hay archivos (`has_view`/`require_view`). `filters.build_query(spec, base)` / `build_history_query`: filtros con nombres de contratos traducidos con `column_map` (`UnsupportedFilterError` si no hay columna); `--nit-entidad` en interadministrativos vía `codigo_entidad` de contratos (sólo SECOP II); `plataforma`. `combined.py`: vista `contratos_todos` (ambas bases, sólo con `--base todas`/`sql`; `TODAS` como destino de filtros, `solo_interadministrativos`). Exportador por extensión. |
 | `secop/cli.py` | Typer: `etl backfill|incremental|reparar`, `query`, `historial`, `sql`, `info`; `--base` y `--plataforma`. |
 
 Reglas entre particiones (`pipeline._apply_batch`):
@@ -168,8 +170,12 @@ interadministrativos (PR `feat/base-interadministrativos`):
   por fila, la unidad es el contrato (85.852 contratos, 87.231 filas al cargar).
 - El 95,5 % de su SECOP II ya está en contratos; contratos tiene 127.146 contratos
   justificados como convenio interadministrativo, sólo el 42 % está en `s484-c9k3`.
-- La vista combinada `contratos_todos` está diseñada en `columnMapping.md` y queda para
-  un PR posterior (decisión del usuario).
+- Vista combinada `contratos_todos` (`secop/query/combined.py`, rama
+  `feat/vista-combinada`): parte A = todas las filas de contratos + columnas nuevas
+  de los convenios solapados (1:1 por `id_contrato`); parte B = filas de
+  interadministrativos que no están en contratos, renombradas con `column_map`. No
+  completa datos (p.ej. `nit_entidad` NULL en parte B). En R2: 6.120.107 + 33.712
+  SECOP I + 76 SECOP II = 6.153.895 filas. Diseño y mapeo en `columnMapping.md`.
 - Primera carga en R2 (2026-10-12, desde la rama, antes de integrar el PR: el código
   de `main` sólo lee `*/data.parquet`): 85.852 contratos en 87.231 filas (33.712
   SECOP I, 53.519 SECOP II), 28 particiones, ~19 MB. Antes/después se compararon los
@@ -207,8 +213,9 @@ Pendientes / limitaciones conocidas:
   ids escapados), nunca entrada de usuario. `secop sql` ejecuta SQL arbitrario por
   diseño (herramienta local).
 - `Settings` acepta el token heredado `ID_TOKEN` como alias de `SOCRATA_APP_TOKEN`.
-- Bases sin columna de versión (interadministrativos): el estado guarda y la CLI
-  muestra el watermark por defecto (2018-01-01), que ahí no significa nada.
+- El estado de interadministrativos en R2 aún guarda el watermark por defecto
+  (2018-01-01) hasta su próxima corrida, que lo cambia a `null`; la CLI ya muestra
+  "no aplica" (rama `feat/vista-combinada`).
 
 ## Otros archivos
 

@@ -46,13 +46,21 @@ def data_key(partition: str, base: Base = CONTRATOS) -> str:
 
 
 def assign_partitions(df: pd.DataFrame, base: Base = CONTRATOS) -> pd.Series:
-    """Serie con la partición destino de cada fila (según fecha de inicio)."""
+    """Serie con la partición destino de cada fila (según fecha de inicio).
+
+    En una base agrupada todas las filas de un contrato van a la misma
+    partición: la del año válido más temprano entre sus filas (``unknown`` si
+    ninguna tiene fecha válida), para que el contrato nunca se parta.
+    """
     if base.partition_date_column not in df.columns:
         return pd.Series([UNKNOWN_PARTITION] * len(df), index=df.index)
     dates = df[base.partition_date_column]
     years = pd.to_datetime(dates, errors="coerce").dt.year
     lo, hi = _MIN_REAL_YEAR, _max_real_year()
     valid = years.between(lo, hi)
+    if base.grouped and base.key in df.columns:
+        years = years.where(valid).groupby(df[base.key]).transform("min")
+        valid = years.notna()
     out = pd.Series(UNKNOWN_PARTITION, index=df.index, dtype="object")
     out[valid] = "year=" + years[valid].astype("Int64").astype(str)
     return out
@@ -111,10 +119,12 @@ def compact(df: pd.DataFrame, base: Base = CONTRATOS) -> pd.DataFrame:
 class MergeResult:
     """Resultado de fusionar versiones de contratos en una partición."""
 
-    #: Una fila por ``id_contrato``: la versión vigente.
+    #: Versión vigente de cada contrato (una fila, o varias en bases agrupadas).
     rows: pd.DataFrame
     #: Versiones perdedoras cuyo contenido difiere de la vigente (van al historial).
     superseded: pd.DataFrame
+    #: ``False`` si la partición quedaría idéntica (no hace falta reescribirla).
+    changed: bool = True
 
 
 def merge_versions(
@@ -126,8 +136,11 @@ def merge_versions(
 
     Gana la ``ultima_actualizacion`` mayor; en empate (o ambas nulas) gana la
     más reciente en llegar (``incoming``). Las perdedoras con contenido distinto
-    de la ganadora se devuelven en ``superseded`` para no perderlas.
+    de la ganadora se devuelven en ``superseded`` para no perderlas. En una
+    base agrupada la versión es el contrato completo (ver ``_merge_groups``).
     """
+    if base.grouped:
+        return _merge_groups(existing, incoming, base)
     frames = [
         _canonicalize_dtypes(f.copy(), base.schema)
         for f in (existing, incoming)
@@ -146,6 +159,58 @@ def merge_versions(
     return MergeResult(
         rows=combined[winner].reset_index(drop=True),
         superseded=superseded.reset_index(drop=True),
+    )
+
+
+def _signatures(keys: pd.Series, hashes: pd.Series) -> pd.Series:
+    """Firma de cada contrato: sus hashes de fila ordenados (multiconjunto)."""
+    frame = pd.DataFrame({"key": keys.to_numpy(), "h": hashes.to_numpy()})
+    return frame.groupby("key")["h"].agg(lambda s: tuple(sorted(s)))
+
+
+def _merge_groups(
+    existing: pd.DataFrame | None, incoming: pd.DataFrame, base: Base
+) -> MergeResult:
+    """Merge de una base agrupada: la unidad de versión es el contrato completo.
+
+    Las filas idénticas de un mismo contrato se colapsan. Si las filas de un
+    contrato no cambiaron se conserva tal cual; si cambió cualquiera, todas las
+    filas anteriores van a ``superseded`` y entran las nuevas. Los contratos
+    que no vienen en ``incoming`` se conservan (nunca se borra).
+    """
+    key = base.key
+    frames = [
+        _canonicalize_dtypes(f.copy(), base.schema).assign(_origen=n)
+        for n, f in enumerate((existing, incoming))
+        if f is not None and not f.empty
+    ]
+    if not frames:
+        empty = incoming.iloc[0:0]
+        return MergeResult(rows=empty, superseded=empty, changed=False)
+    # Hash sobre el concat: ambos lados con las mismas columnas y dtypes.
+    combined = pd.concat(frames, ignore_index=True)
+    hashes = history.content_hash(combined.drop(columns="_origen"))
+    is_new = combined["_origen"] == 1
+    # Filas idénticas sólo se colapsan dentro de lo que llega: una fila nueva
+    # igual a una existente sigue siendo parte del contrato nuevo.
+    dup_new = pd.Series(False, index=combined.index)
+    dup_new[is_new] = hashes[is_new].duplicated().to_numpy()
+    unique_new = is_new & ~dup_new
+    sig_new = _signatures(combined.loc[unique_new, key], hashes[unique_new])
+    old_mask = ~is_new & combined[key].isin(sig_new.index)
+    sig_old = _signatures(combined.loc[old_mask, key], hashes[old_mask])
+    same = sig_old.reindex(sig_new.index) == sig_new
+    replace = set(sig_new.index[~same])
+    superseded = combined[~is_new & combined[key].isin(replace)]
+    rows = combined[
+        (~is_new & ~combined[key].isin(replace))
+        | (unique_new & combined[key].isin(replace))
+    ]
+    return MergeResult(
+        rows=rows.drop(columns="_origen").reset_index(drop=True),
+        superseded=superseded.drop(columns="_origen").reset_index(drop=True),
+        # Los contratos nuevos también están en ``replace`` (sin firma vieja).
+        changed=bool(replace),
     )
 
 
@@ -224,7 +289,10 @@ def _apply_merge(
         detected_at=detected_at,
         base=base,
     )
-    write_partition(store, partition, result.rows, base)
+    if result.changed:
+        write_partition(store, partition, result.rows, base)
+    else:
+        logger.info("Partición %s/%s sin cambios", partition, base.data_file)
     return result.rows
 
 

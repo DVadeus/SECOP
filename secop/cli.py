@@ -68,6 +68,19 @@ def _base(name: str):
         raise typer.BadParameter(str(exc), param_hint="--base") from exc
 
 
+#: ``--base todas``: la vista combinada (sólo para consultar, no tiene ETL).
+_TODAS = "todas"
+
+
+def _target(name: str):
+    """Destino de consulta: una base, o la vista combinada con ``todas``."""
+    if name == _TODAS:
+        from secop.query.combined import TODAS
+
+        return TODAS
+    return _base(name)
+
+
 @etl_app.command("backfill")
 def etl_backfill(
     start: Annotated[
@@ -210,8 +223,14 @@ def query_cmd(
     modalidad: _OptList = None,
     plataforma: Annotated[
         list[str] | None,
-        typer.Option(help="SECOP_I o SECOP_II (sólo interadministrativos)."),
+        typer.Option(help="SECOP_I o SECOP_II (interadministrativos o todas)."),
     ] = None,
+    solo_interadministrativos: Annotated[
+        bool,
+        typer.Option(
+            help="Sólo contratos interadministrativos (con --base todas).",
+        ),
+    ] = False,
     year_from: Annotated[int | None, typer.Option(help="Año de inicio desde.")] = None,
     year_to: Annotated[int | None, typer.Option(help="Año de inicio hasta.")] = None,
     valor_min: Annotated[
@@ -230,10 +249,14 @@ def query_cmd(
         typer.Option(help="Directorio Parquet a consultar (con --source local)."),
     ] = None,
     base: Annotated[
-        str, typer.Option(help="Base: 'contratos' o 'interadministrativos'.")
+        str,
+        typer.Option(
+            help="Base: 'contratos', 'interadministrativos' o 'todas' (vista "
+            "combinada contratos_todos)."
+        ),
     ] = "contratos",
 ) -> None:
-    """Filtra una base del lake por características y exporta el resultado."""
+    """Filtra una base (o ambas, con --base todas) y exporta el resultado."""
     from secop.query import QueryEngine, export_dataframe
     from secop.query.filters import QuerySpec, build_query
 
@@ -246,6 +269,7 @@ def query_cmd(
         estado=list(estado or []),
         modalidad=list(modalidad or []),
         plataforma=list(plataforma or []),
+        solo_interadministrativos=solo_interadministrativos,
         year_from=year_from,
         year_to=year_to,
         valor_min=valor_min,
@@ -253,13 +277,14 @@ def query_cmd(
         columns=[c.strip() for c in columns.split(",")] if columns else [],
         limit=limit,
     )
-    chosen = _base(base)
+    chosen = _target(base)
+    combined = base == _TODAS
     sql, params = _build(build_query, spec, chosen)
     logger.debug("SQL generado:\n%s", sql)
-    if spec.nit_entidad and chosen.column_map:
+    if spec.nit_entidad and (chosen.column_map or combined):
         console.print(
-            "[yellow]--nit-entidad en interadministrativos se resuelve con el "
-            "código de entidad de la base de contratos: sólo encuentra convenios "
+            "[yellow]--nit-entidad en filas de interadministrativos se resuelve con "
+            "el código de entidad de la base de contratos: sólo encuentra convenios "
             "de SECOP II. Para SECOP I usa --entidad-contains.[/yellow]"
         )
 
@@ -268,6 +293,11 @@ def query_cmd(
         if spec.nit_entidad and chosen.column_map:
             _require(engine, "contratos")  # el NIT se resuelve con contratos
         df = engine.run(sql, params)
+    if combined or chosen.column_map:
+        console.print(
+            "Nota: en SECOP I un contrato puede tener varias filas (una por parte u "
+            "origen de recursos); para contar contratos usa id_contrato únicos."
+        )
 
     if df.empty:
         console.print("[yellow]0 filas. No se escribió ningún archivo.[/yellow]")
@@ -371,6 +401,11 @@ def historial_cmd(
     from secop.query import QueryEngine, export_dataframe
     from secop.query.filters import build_history_query
 
+    if base == _TODAS:
+        raise typer.BadParameter(
+            "el historial es por base: usa --base contratos o interadministrativos",
+            param_hint="--base",
+        )
     chosen = _base(base)
     try:
         sql, params = build_history_query(
@@ -417,19 +452,25 @@ def info_cmd(
         Path | None, typer.Option(help="Directorio Parquet (con --source local).")
     ] = None,
     base: Annotated[
-        str, typer.Option(help="Base: 'contratos' o 'interadministrativos'.")
+        str,
+        typer.Option(
+            help="Base: 'contratos', 'interadministrativos' o 'todas' (combinada)."
+        ),
     ] = "contratos",
 ) -> None:
     """Muestra el estado de una base: particiones, filas, fechas, watermark."""
+    from secop.bases import Base
     from secop.query import QueryEngine
 
-    chosen = _base(base)
+    chosen = _target(base)
     with QueryEngine.from_source(source, path=path) as engine:
         _require(engine, chosen.name)
         summary = engine.partition_summary(chosen)
         total = int(summary["filas"].sum()) if not summary.empty else 0
         lo, hi = engine.date_range(chosen)
-        glob = engine.globs[chosen.name]
+        glob = engine.globs.get(
+            chosen.name, "vista combinada (contratos + interadministrativos)"
+        )
 
     table = Table(title=f"Lake SECOP: {chosen.name} ({source})")
     table.add_column("year")
@@ -441,7 +482,7 @@ def info_cmd(
     console.print(f"Rango {chosen.partition_date_column}: {lo} -> {hi}")
     console.print(f"Glob: {glob}")
 
-    if source == "r2":
+    if source == "r2" and isinstance(chosen, Base):
         _print_state(chosen)
 
 
@@ -458,11 +499,12 @@ def _print_state(base: object) -> None:
         return
     # Una base sin columna de versión no tiene watermark (aunque un estado viejo
     # guarde el valor por defecto).
-    watermark = state.ultima_actualizacion if base.version_column else None
-    console.print(
-        f"Watermark ({base.version_column or 'sin columna de versión'}): "
-        f"[bold]{_watermark_text(watermark)}[/bold]"
-    )
+    if base.version_column:
+        label = f"Watermark ({base.version_column})"
+        value = _watermark_text(state.ultima_actualizacion)
+    else:
+        label, value = "Watermark", _watermark_text(None)
+    console.print(f"{label}: [bold]{value}[/bold]")
     console.print(f"Última corrida: {state.last_run_utc}")
     console.print(f"Versión de esquema: {state.schema_version}")
 

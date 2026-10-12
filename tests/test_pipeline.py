@@ -55,11 +55,11 @@ def _fake_source(monkeypatch: pytest.MonkeyPatch, records: list[Record]) -> None
     """El origen publica ``records``: foto ligera + descarga por id."""
     snapshot = pd.DataFrame.from_records(records)
 
-    def by_ids(ids: list[str]) -> list[Record]:
+    def by_ids(ids: list[str], **_kwargs: object) -> list[Record]:
         wanted = set(ids)
         return [r for r in records if r["id_contrato"] in wanted]
 
-    monkeypatch.setattr(pipeline, "fetch_snapshot", lambda _cols: snapshot)
+    monkeypatch.setattr(pipeline, "fetch_snapshot", lambda _cols, **_kw: snapshot)
     monkeypatch.setattr(pipeline, "fetch_by_ids", by_ids)
 
 
@@ -205,9 +205,9 @@ def test_resumed_backfill_counts_skipped_years(
     monkeypatch.setattr(
         pipeline,
         "_fetch_year",
-        lambda y: to_dataframe([_rec("Y1", f"{y}-03-01T00:00:00")]),
+        lambda y, _base: to_dataframe([_rec("Y1", f"{y}-03-01T00:00:00")]),
     )
-    monkeypatch.setattr(pipeline, "_fetch_tail", lambda a, b: pd.DataFrame())
+    monkeypatch.setattr(pipeline, "_fetch_tail", lambda a, b, _base: pd.DataFrame())
 
     result = pipeline.backfill(store, start_year=2018, end_year=2019)
 
@@ -231,7 +231,7 @@ def test_forced_backfill_never_deletes_contracts(
     monkeypatch.setattr(
         pipeline,
         "_fetch_year",
-        lambda y: to_dataframe([_rec("B", f"{y}-02-01T00:00:00", valor="2")]),
+        lambda y, _base: to_dataframe([_rec("B", f"{y}-02-01T00:00:00", valor="2")]),
     )
     pipeline.backfill(store, start_year=2024, end_year=2024, only_year=2024, force=True)
     assert _ids(store)["year=2024"] == ["B", "BORRADO_EN_ORIGEN"]

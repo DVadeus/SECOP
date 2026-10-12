@@ -12,7 +12,8 @@ import logging
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 
-from secop.config import DEFAULT_START_YEAR, STATE_KEY
+from secop.bases import CONTRATOS, Base
+from secop.config import DEFAULT_START_YEAR
 from secop.storage.base import ObjectStore
 
 logger = logging.getLogger(__name__)
@@ -22,7 +23,7 @@ _DEFAULT_WATERMARK = datetime(DEFAULT_START_YEAR, 1, 1, tzinfo=UTC)
 
 @dataclass(slots=True)
 class PipelineState:
-    """Contenido de ``state/contratos.json``."""
+    """Contenido de ``base.state_key`` (p.ej. ``state/contratos.json``)."""
 
     ultima_actualizacion: str = _DEFAULT_WATERMARK.isoformat()
     last_run_utc: str | None = None
@@ -36,13 +37,15 @@ class PipelineState:
         return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
 
 
-def load_state(store: ObjectStore) -> PipelineState:
+def load_state(store: ObjectStore, base: Base = CONTRATOS) -> PipelineState:
     """Carga el estado; devuelve el default si el objeto aún no existe."""
     try:
-        raw = store.get_bytes(STATE_KEY)
+        raw = store.get_bytes(base.state_key)
     except KeyError:
         logger.info(
-            "Sin estado previo en %s/%s; se usa el default", store.label, STATE_KEY
+            "Sin estado previo en %s/%s; se usa el default",
+            store.label,
+            base.state_key,
         )
         return PipelineState()
     data = json.loads(raw.decode("utf-8"))
@@ -50,9 +53,11 @@ def load_state(store: ObjectStore) -> PipelineState:
     return PipelineState(**{k: v for k, v in data.items() if k in known})
 
 
-def save_state(store: ObjectStore, state: PipelineState) -> None:
+def save_state(
+    store: ObjectStore, state: PipelineState, base: Base = CONTRATOS
+) -> None:
     """Persiste el estado (marca ``last_run_utc`` con la hora actual)."""
     state.last_run_utc = datetime.now(UTC).isoformat()
     payload = json.dumps(asdict(state), indent=2, ensure_ascii=False).encode("utf-8")
-    store.put_bytes(STATE_KEY, payload)
+    store.put_bytes(base.state_key, payload)
     logger.info("Watermark guardado: %s", state.ultima_actualizacion)

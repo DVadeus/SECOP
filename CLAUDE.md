@@ -170,6 +170,11 @@ interadministrativos (PR `feat/base-interadministrativos`):
   justificados como convenio interadministrativo, sólo el 42 % está en `s484-c9k3`.
 - La vista combinada `contratos_todos` está diseñada en `columnMapping.md` y queda para
   un PR posterior (decisión del usuario).
+- Primera carga en R2 (2026-10-12, desde la rama, antes de integrar el PR: el código
+  de `main` sólo lee `*/data.parquet`): 85.852 contratos en 87.231 filas (33.712
+  SECOP I, 53.519 SECOP II), 28 particiones, ~19 MB. Antes/después se compararon los
+  ETag de los 52 objetos previos: ninguno cambió (31 objetos nuevos). Una segunda
+  corrida escribió 0 contratos y sólo reescribió estado y manifest.
 
 Defectos del código y etapa que los corrigió (commits del PR #1, `fix/integridad-lake`):
 
@@ -202,6 +207,8 @@ Pendientes / limitaciones conocidas:
   ids escapados), nunca entrada de usuario. `secop sql` ejecuta SQL arbitrario por
   diseño (herramienta local).
 - `Settings` acepta el token heredado `ID_TOKEN` como alias de `SOCRATA_APP_TOKEN`.
+- Bases sin columna de versión (interadministrativos): el estado guarda y la CLI
+  muestra el watermark por defecto (2018-01-01), que ahí no significa nada.
 
 ## Otros archivos
 

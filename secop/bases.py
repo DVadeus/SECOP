@@ -74,6 +74,10 @@ class Base:
     grouped: bool = False
     #: Pares (columna propia, columna equivalente de la base de contratos).
     column_pairs: tuple[tuple[str, str], ...] = ()
+    #: Columna para "lo más reciente primero" (``--limit``).
+    recency_column: str = WATERMARK_COLUMN
+    #: Columna con la plataforma SECOP_I/SECOP_II (``--plataforma``), si existe.
+    platform_column: str | None = None
 
     @property
     def column_map(self) -> dict[str, str]:
@@ -188,6 +192,8 @@ INTERADMINISTRATIVOS = Base(
         # Mismo concepto, otro vocabulario: se funde con su valor original.
         ("tipo_contratista", "tipodocproveedor"),
     ),
+    recency_column="fecha_cargue",
+    platform_column="fuente",
 )
 
 BASES: dict[str, Base] = {b.name: b for b in (CONTRATOS, INTERADMINISTRATIVOS)}

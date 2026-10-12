@@ -9,18 +9,13 @@ from types import TracebackType
 import duckdb
 import pandas as pd
 
-from secop.config import (
-    DATA_FILE,
-    HISTORY_PREFIX,
-    LAKE_PREFIX,
-    Settings,
-    get_settings,
-)
+from secop.bases import BASES, CONTRATOS, Base
+from secop.config import Settings, get_settings
 
 logger = logging.getLogger(__name__)
 
-VIEW_NAME = "contratos"
-HISTORY_VIEW_NAME = "contratos_historial"
+VIEW_NAME = CONTRATOS.name
+HISTORY_VIEW_NAME = CONTRATOS.history_view
 
 
 def _q(value: str) -> str:
@@ -29,10 +24,12 @@ def _q(value: str) -> str:
 
 
 class QueryEngine:
-    """Abre una conexión DuckDB y expone la vista ``contratos``.
+    """Abre una conexión DuckDB y expone una vista por base y su historial.
 
-    Si hay historial de versiones, expone además ``contratos_historial``
-    (ver ``has_history``).
+    Vistas: ``contratos`` e ``interadministrativos`` (cada una lee sólo su
+    archivo de las carpetas ``year=*``) y, si hay versiones reemplazadas,
+    ``contratos_historial`` e ``interadministrativos_historial``. Una vista sólo
+    existe si hay archivos (ver ``has_view``).
 
     Úsese como context manager::
 
@@ -43,23 +40,46 @@ class QueryEngine:
     def __init__(
         self,
         connection: duckdb.DuckDBPyConnection,
-        glob: str,
-        history_glob: str | None = None,
+        globs: dict[str, str],
+        history_globs: dict[str, str] | None = None,
     ) -> None:
         self._con = connection
-        self.glob = glob
-        self.history_glob = history_glob
-        self._create_view(VIEW_NAME, glob)
-        self.has_history = bool(history_glob) and self._glob_has_files(history_glob)
-        if self.has_history and history_glob:
-            self._create_view(HISTORY_VIEW_NAME, history_glob)
+        self.globs = dict(globs)
+        self.history_globs = dict(history_globs or {})
+        self.views: set[str] = set()
+        for base_name, glob in self.globs.items():
+            self._create_view_if_files(BASES[base_name].name, glob)
+        for base_name, glob in self.history_globs.items():
+            self._create_view_if_files(BASES[base_name].history_view, glob)
 
-    def _create_view(self, name: str, glob: str) -> None:
+    @property
+    def glob(self) -> str:
+        """Glob de la base de contratos (compatibilidad)."""
+        return self.globs[CONTRATOS.name]
+
+    @property
+    def has_history(self) -> bool:
+        """Hay historial de contratos (compatibilidad; ver ``has_view``)."""
+        return HISTORY_VIEW_NAME in self.views
+
+    def has_view(self, name: str) -> bool:
+        return name in self.views
+
+    def require_view(self, name: str) -> None:
+        """Error claro si una vista no existe (la base aún no tiene datos)."""
+        if name not in self.views:
+            raise LookupError(f"No hay datos para la vista {name!r} en este origen")
+
+    def _create_view_if_files(self, name: str, glob: str) -> None:
+        if not self._glob_has_files(glob):
+            logger.debug("Sin archivos para la vista %s (%s)", name, glob)
+            return
         self._con.execute(
             f"CREATE OR REPLACE VIEW {name} AS "
             f"SELECT * FROM read_parquet('{_q(glob)}', "
             f"hive_partitioning => true, union_by_name => true)"
         )
+        self.views.add(name)
 
     def _glob_has_files(self, glob: str) -> bool:
         row = self._con.execute("SELECT count(*) FROM glob(?)", [glob]).fetchone()
@@ -78,19 +98,45 @@ class QueryEngine:
         con = duckdb.connect(database=":memory:")
         if source == "r2":
             root = cls._configure_r2(con, settings)
-            glob = f"{root}/{LAKE_PREFIX}/year=*/{DATA_FILE}"
-            history_glob = f"{root}/{HISTORY_PREFIX}/detectado=*/{DATA_FILE}"
+            globs, history = cls._globs_r2(root)
         elif source == "local":
-            # Sólo el data.parquet compactado de cada "year=..."; así se ignoran
-            # los part-*.parquet y carpetas sin partición Hive del ETL viejo
-            # (p.ej. data/raw/nulls/). Con --path se busca recursivamente.
-            base = Path(path) if path else settings.local_data_dir / LAKE_PREFIX
-            hist = Path(path) if path else settings.local_data_dir / HISTORY_PREFIX
-            glob = f"{base.as_posix().rstrip('/')}/**/year=*/{DATA_FILE}"
-            history_glob = f"{hist.as_posix().rstrip('/')}/**/detectado=*/{DATA_FILE}"
+            globs, history = cls._globs_local(settings, path)
         else:
             raise ValueError(f"source desconocido: {source!r} (usa 'r2' o 'local')")
-        return cls(con, glob, history_glob)
+        return cls(con, globs, history)
+
+    @staticmethod
+    def _globs_r2(root: str) -> tuple[dict[str, str], dict[str, str]]:
+        globs = {
+            b.name: f"{root}/{b.lake_prefix}/year=*/{b.data_file}"
+            for b in BASES.values()
+        }
+        history = {
+            b.name: f"{root}/{b.history_prefix}/detectado=*/{b.data_file}"
+            for b in BASES.values()
+        }
+        return globs, history
+
+    @staticmethod
+    def _globs_local(
+        settings: Settings, path: str | Path | None
+    ) -> tuple[dict[str, str], dict[str, str]]:
+        # Sólo el archivo compactado de cada base en cada "year=..."; así se
+        # ignoran los part-*.parquet y carpetas sin partición Hive del ETL viejo
+        # (p.ej. data/raw/nulls/). Con --path se busca recursivamente.
+        def root(prefix: str) -> str:
+            base_dir = Path(path) if path else settings.local_data_dir / prefix
+            return base_dir.as_posix().rstrip("/")
+
+        globs = {
+            b.name: f"{root(b.lake_prefix)}/**/year=*/{b.data_file}"
+            for b in BASES.values()
+        }
+        history = {
+            b.name: f"{root(b.history_prefix)}/**/detectado=*/{b.data_file}"
+            for b in BASES.values()
+        }
+        return globs, history
 
     @staticmethod
     def _configure_r2(con: duckdb.DuckDBPyConnection, settings: Settings) -> str:
@@ -122,20 +168,25 @@ class QueryEngine:
         logger.debug("SQL: %s", sql)
         return self._con.execute(sql, params or []).df()
 
-    def count(self) -> int:
-        value = self.run(f"SELECT count(*) AS n FROM {VIEW_NAME}").iat[0, 0]
+    def count(self, base: Base = CONTRATOS) -> int:
+        self.require_view(base.name)
+        value = self.run(f"SELECT count(*) AS n FROM {base.name}").iat[0, 0]
         return int(value)  # pyright: ignore[reportArgumentType]
 
-    def partition_summary(self) -> pd.DataFrame:
+    def partition_summary(self, base: Base = CONTRATOS) -> pd.DataFrame:
+        self.require_view(base.name)
         return self.run(
-            f"SELECT year, count(*) AS filas FROM {VIEW_NAME} "
+            f"SELECT year, count(*) AS filas FROM {base.name} "
             f"GROUP BY year ORDER BY year"
         )
 
-    def date_range(self) -> tuple[pd.Timestamp | None, pd.Timestamp | None]:
+    def date_range(
+        self, base: Base = CONTRATOS
+    ) -> tuple[pd.Timestamp | None, pd.Timestamp | None]:
+        self.require_view(base.name)
+        col = base.partition_date_column
         row = self.run(
-            f"SELECT min(fecha_de_inicio_del_contrato) AS lo, "
-            f"max(fecha_de_inicio_del_contrato) AS hi FROM {VIEW_NAME}"
+            f"SELECT min({col}) AS lo, max({col}) AS hi FROM {base.name}"
         ).iloc[0]
         return row["lo"], row["hi"]
 

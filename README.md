@@ -150,13 +150,47 @@ Particularidades de la base:
   fila, todas sus filas anteriores pasan al historial. Para contar contratos usa
   `count(DISTINCT id_contrato)`.
 - No tiene `ultima_actualizacion`: cada semana se baja completa (~1 min) y el hash del
-  contenido decide qué cambió. Nunca se borra nada.
+  contenido decide qué cambió. Nunca se borra nada. Por eso no tiene watermark: `info`
+  muestra "no aplica".
 - El 95 % de sus convenios de SECOP II también está en `contratos`, con más columnas.
+
+### Ambas bases en una consulta (`--base todas`)
+
+La vista `contratos_todos` une las dos bases:
+
+- **Todas las filas de `contratos`**, con sus columnas.
+- Los convenios que también están en interadministrativos (unidos por `id_contrato`)
+  no se duplican: solo reciben las columnas nuevas.
+- **Las filas de interadministrativos que no están en contratos** (sobre todo
+  SECOP I), con sus columnas renombradas a las de contratos.
+
+Agrega solo estas columnas:
+
+| Columna | Qué indica |
+|---|---|
+| `base_origen` | `contratos` o `interadministrativos` (de dónde sale la fila) |
+| `plataforma` | `SECOP_I` / `SECOP_II` |
+| `fecha_cargue` | Fecha de carga en el dataset de convenios |
+| `unspsc_clase_nombre` | UNSPSC de SECOP I (nombre de clase, no código) |
+| `en_base_interadministrativos` | El contrato está en `s484-c9k3` |
+| `es_interadministrativo` | Justificación de convenio interadministrativo en contratos, o está en `s484-c9k3` |
+
+```bash
+# Todos los convenios interadministrativos de una entidad desde 2024
+uv run secop query --base todas --nit-entidad 900475780 --solo-interadministrativos --year-from 2024 -o unp_convenios.xlsx
+uv run secop info --base todas
+```
+
+Hacen falta las dos marcas: `contratos` tiene ~127 mil contratos justificados como
+convenio interadministrativo, y solo el 42 % está en `s484-c9k3`. La vista no completa
+datos que el origen no publica: `nit_entidad` queda vacío en las filas de
+interadministrativos. Aun así, `--nit-entidad` las encuentra cuando son de SECOP II,
+por el código de entidad. El mapeo medido está en `memory-bank/columnMapping.md`.
 
 ### SQL directo
 
-Vistas disponibles: `contratos`, `interadministrativos`, `contratos_historial` e
-`interadministrativos_historial`.
+Vistas disponibles: `contratos`, `interadministrativos`, `contratos_todos`,
+`contratos_historial` e `interadministrativos_historial`.
 
 ```bash
 uv run secop sql "SELECT year, count(*) FROM contratos GROUP BY 1 ORDER BY 1"

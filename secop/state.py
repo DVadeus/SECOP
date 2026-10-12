@@ -25,14 +25,18 @@ _DEFAULT_WATERMARK = datetime(DEFAULT_START_YEAR, 1, 1, tzinfo=UTC)
 class PipelineState:
     """Contenido de ``base.state_key`` (p.ej. ``state/contratos.json``)."""
 
-    ultima_actualizacion: str = _DEFAULT_WATERMARK.isoformat()
+    #: Mayor ``ultima_actualizacion`` del lake (informativo). ``None`` en bases sin
+    #: columna de versión, donde un watermark no tiene sentido.
+    ultima_actualizacion: str | None = _DEFAULT_WATERMARK.isoformat()
     last_run_utc: str | None = None
     row_counts: dict[str, int] = field(default_factory=dict)
     schema_version: str | None = None
 
     @property
-    def watermark(self) -> datetime:
-        """``ultima_actualizacion`` como ``datetime`` con tz."""
+    def watermark(self) -> datetime | None:
+        """``ultima_actualizacion`` como ``datetime`` con tz (``None`` si no aplica)."""
+        if self.ultima_actualizacion is None:
+            return None
         dt = datetime.fromisoformat(self.ultima_actualizacion)
         return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
 
@@ -60,4 +64,8 @@ def save_state(
     state.last_run_utc = datetime.now(UTC).isoformat()
     payload = json.dumps(asdict(state), indent=2, ensure_ascii=False).encode("utf-8")
     store.put_bytes(base.state_key, payload)
-    logger.info("Watermark guardado: %s", state.ultima_actualizacion)
+    logger.info(
+        "Estado de %s guardado (watermark: %s)",
+        base.name,
+        state.ultima_actualizacion or "no aplica",
+    )

@@ -156,9 +156,11 @@ def _finish(
     state = load_state(store, base)
     # Conteos de todo el lake (incluye los años omitidos por ya existir).
     state.row_counts = id_index.row_counts(idx)
-    # Informativo: la extracción no depende de él (ver secop.diff).
-    top = id_index.max_watermark(idx)
-    if top is not None:
+    # Informativo: la extracción no depende de él (ver secop.diff). Una base sin
+    # columna de versión no tiene watermark: se guarda null, no el valor por defecto.
+    if base.version_column is None:
+        state.ultima_actualizacion = None
+    elif (top := id_index.max_watermark(idx)) is not None:
         state.ultima_actualizacion = top.isoformat()
     state.schema_version = SCHEMA_VERSION
     save_state(store, state, base)

@@ -9,8 +9,9 @@ from types import TracebackType
 import duckdb
 import pandas as pd
 
-from secop.bases import BASES, CONTRATOS, Base
+from secop.bases import BASES, CONTRATOS, INTERADMINISTRATIVOS, Base
 from secop.config import Settings, get_settings
+from secop.query.combined import COMBINED_VIEW, CombinedView, combined_view_sql
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +28,8 @@ class QueryEngine:
     """Abre una conexión DuckDB y expone una vista por base y su historial.
 
     Vistas: ``contratos`` e ``interadministrativos`` (cada una lee sólo su
-    archivo de las carpetas ``year=*``) y, si hay versiones reemplazadas,
+    archivo de las carpetas ``year=*``), ``contratos_todos`` (ambas bases unidas,
+    ver ``secop.query.combined``) y, si hay versiones reemplazadas,
     ``contratos_historial`` e ``interadministrativos_historial``. Una vista sólo
     existe si hay archivos (ver ``has_view``).
 
@@ -51,6 +53,20 @@ class QueryEngine:
             self._create_view_if_files(BASES[base_name].name, glob)
         for base_name, glob in self.history_globs.items():
             self._create_view_if_files(BASES[base_name].history_view, glob)
+        self._create_combined_view()
+
+    def _columns(self, view: str) -> set[str]:
+        return set(self.run(f"DESCRIBE {view}")["column_name"])
+
+    def _create_combined_view(self) -> None:
+        """``contratos_todos`` (ver ``secop.query.combined``) si existen ambas bases."""
+        if not {CONTRATOS.name, INTERADMINISTRATIVOS.name} <= self.views:
+            return
+        sql = combined_view_sql(
+            self._columns(CONTRATOS.name), self._columns(INTERADMINISTRATIVOS.name)
+        )
+        self._con.execute(sql)
+        self.views.add(COMBINED_VIEW)
 
     @property
     def glob(self) -> str:
@@ -168,12 +184,12 @@ class QueryEngine:
         logger.debug("SQL: %s", sql)
         return self._con.execute(sql, params or []).df()
 
-    def count(self, base: Base = CONTRATOS) -> int:
+    def count(self, base: Base | CombinedView = CONTRATOS) -> int:
         self.require_view(base.name)
         value = self.run(f"SELECT count(*) AS n FROM {base.name}").iat[0, 0]
         return int(value)  # pyright: ignore[reportArgumentType]
 
-    def partition_summary(self, base: Base = CONTRATOS) -> pd.DataFrame:
+    def partition_summary(self, base: Base | CombinedView = CONTRATOS) -> pd.DataFrame:
         self.require_view(base.name)
         return self.run(
             f"SELECT year, count(*) AS filas FROM {base.name} "
@@ -181,7 +197,7 @@ class QueryEngine:
         )
 
     def date_range(
-        self, base: Base = CONTRATOS
+        self, base: Base | CombinedView = CONTRATOS
     ) -> tuple[pd.Timestamp | None, pd.Timestamp | None]:
         self.require_view(base.name)
         col = base.partition_date_column

@@ -57,15 +57,25 @@ Both flags are needed: contratos has 127,146 contracts justified as interadminis
 agreements and only 53,445 (42 %) are in `s484-c9k3`, which starts with loads from
 Dec 2023.
 
-## Combined view `contratos_todos` — design for a later PR (not implemented)
+## Combined view `contratos_todos` — implemented (`secop/query/combined.py`)
+
+Query with `secop query --base todas` / `secop info --base todas`, or in `secop sql`.
 
 - Part A: all `contratos` rows + `LEFT JOIN` 1:1 on `id_contrato` with
-  interadministrativos (SECOP II), bringing only `fecha_cargue`, `plataforma` and the
-  flags. For overlapping contracts the contratos values win (updated by version);
+  interadministrativos, bringing only `fecha_cargue` and the flags; `plataforma` is
+  `SECOP_II`. For overlapping contracts the contratos values win (updated by version);
   differences (contractor name 1.2 %, entity name 0.6 %, state 0.3 %) can be audited by
   comparing the two views.
 - Part B (`UNION ALL BY NAME`): interadministrativos rows whose `id_contrato` is not in
-  contratos (~33.7 k SECOP I rows, a few SECOP II), columns renamed with the mapping and
-  contratos-only columns NULL.
+  contratos, columns renamed with the mapping and contratos-only columns NULL. For
+  SECOP II rows, `unspsc_id_clase` goes to `codigo_de_categoria_principal` (it is a
+  code there); for SECOP I, to `unspsc_clase_nombre`.
+- The view never fills data the source does not publish: `nit_entidad` is NULL in part
+  B. The `--nit-entidad` filter matches part-B rows through `codigo_entidad`, which maps
+  1:1 to `nit_entidad` in contratos (0 codes with more than one NIT, 2026-10-12) — SECOP
+  II only.
+- `--solo-interadministrativos` filters `es_interadministrativo`.
 - Grain: SECOP I may have several rows per contract → count with
   `count(DISTINCT id_contrato)`.
+- In R2 (2026-10-12): 6,120,107 contratos rows + 33,712 SECOP I + 76 SECOP II rows
+  = 6,153,895.

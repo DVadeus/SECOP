@@ -72,4 +72,10 @@ The same `id_contrato` may legitimately appear in two real years (the source cha
 its start date — kept as evidence). It must never appear both in `year=unknown` and in
 a real year.
 
-Column mapping between bases: `columnMapping.md`.
+Column mapping between bases and the combined query view `contratos_todos` (both bases
+in one query, no data stored): `columnMapping.md`.
+
+Watermark
+
+`ultima_actualizacion` in `state/<base>.json` is informational. Bases without a version
+column (interadministrativos) store `null` and the CLI shows "no aplica".

@@ -40,11 +40,18 @@ jobs:
       - name: Sincronizar dependencias (sin grupo analysis)
         run: uv sync --no-group analysis --no-group dev
 
-      - name: Incremental
+      - name: Incremental contratos
         if: ${{ github.event_name != 'workflow_dispatch' || inputs.year == '' }}
         # Un reintento: el origen se recarga a diario y, si ocurre durante la
         # foto, la corrida aborta sin escribir nada (es idempotente).
         run: uv run secop etl incremental || (sleep 900 && uv run secop etl incremental)
+
+      - name: Incremental interadministrativos
+        # always(): corre aunque falle el paso de contratos (bases independientes).
+        if: ${{ always() && (github.event_name != 'workflow_dispatch' || inputs.year == '') }}
+        run: >-
+          uv run secop etl incremental --base interadministrativos
+          || (sleep 900 && uv run secop etl incremental --base interadministrativos)
 
       - name: Re-procesar un año
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.year != '' }}

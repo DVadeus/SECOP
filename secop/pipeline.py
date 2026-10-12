@@ -29,8 +29,13 @@ import pandas as pd
 
 from secop import diff, history, lake
 from secop import index as id_index
-from secop.bases import CONTRATOS, Base
-from secop.extract import fetch_by_ids, fetch_data, fetch_snapshot
+from secop.bases import CONTRATOS, STRATEGY_FULL_REFRESH, Base
+from secop.extract import (
+    fetch_all_checked,
+    fetch_by_ids,
+    fetch_data,
+    fetch_snapshot,
+)
 from secop.schema import SCHEMA_VERSION
 from secop.state import PipelineState, load_state, save_state
 from secop.storage.base import ObjectStore
@@ -238,7 +243,7 @@ def _apply_batch(
     if df.empty or base.key not in df.columns:
         return idx, written, 0
     batch = _classify(idx, df, base)
-    applied = len(batch.to_write)
+    applied = 0
     _log_year_changes(idx, batch.to_write, batch.targets, base)
     if not batch.lost_date.empty:
         history.append(
@@ -250,11 +255,13 @@ def _apply_batch(
             base=base,
         )
     for partition, group in batch.to_write.groupby(batch.targets):
-        rows = lake.upsert_partition(
+        merged = lake.upsert(
             store, str(partition), group, detected_at=detected_at, base=base
         )
-        idx = id_index.replace_partition(idx, str(partition), rows, base)
-        written[str(partition)] = len(rows)
+        idx = id_index.replace_partition(idx, str(partition), merged.rows, base)
+        applied += merged.applied
+        if merged.changed:
+            written[str(partition)] = len(merged.rows)
     # Después de escribir las versiones con fecha: sacar sus copias de unknown.
     # El índice (fiable gracias a la marca de corrida) evita leer year=unknown
     # cuando ningún id del lote está ahí.
@@ -299,7 +306,11 @@ def backfill(
 
     Siempre fusiona con lo que ya hay en el lake: ``force`` vuelve a descargar
     años existentes, pero nunca elimina contratos que el origen ya no publique.
+    Una base ``full_refresh`` se baja completa (los años no aplican).
     """
+    if base.strategy == STRATEGY_FULL_REFRESH:
+        logger.info("%s se descarga completa; se ignoran años y --force", base.name)
+        return _full_refresh(store, base, mode="backfill")
     result = RunResult(mode="backfill")
     years = (
         [only_year] if only_year is not None else list(range(start_year, end_year + 1))
@@ -349,7 +360,10 @@ def incremental(store: ObjectStore, base: Base = CONTRATOS) -> RunResult:
     y descarga completos sólo los ids nuevos, actualizados o fuera de su
     partición: contratos nuevos aunque no tengan ``ultima_actualizacion``,
     ``unknown`` que ya tienen fecha, cambios de año y versiones más nuevas.
+    Una base ``full_refresh`` se baja completa y se fusiona por contenido.
     """
+    if base.strategy == STRATEGY_FULL_REFRESH:
+        return _full_refresh(store, base, mode="incremental")
     result = RunResult(mode="incremental")
     idx = _begin(store, "incremental", base)
     run_at = datetime.now(UTC)
@@ -362,6 +376,22 @@ def incremental(store: ObjectStore, base: Base = CONTRATOS) -> RunResult:
         idx, written, applied = _apply_batch(store, idx, df, run_at, base)
         _record(result, written, applied)
 
+    _finish(store, idx, result, base)
+    return result
+
+
+def _full_refresh(store: ObjectStore, base: Base, mode: str) -> RunResult:
+    """Baja el dataset completo y lo fusiona sin borrar nada.
+
+    Para datasets pequeños sin columna de versión: el hash de contenido decide
+    qué contratos cambiaron, y las particiones sin cambios no se reescriben.
+    """
+    result = RunResult(mode=mode)
+    idx = _begin(store, mode, base)
+    run_at = datetime.now(UTC)
+    df = to_dataframe(fetch_all_checked(base=base), base)
+    idx, written, applied = _apply_batch(store, idx, df, run_at, base)
+    _record(result, written, applied)
     _finish(store, idx, result, base)
     return result
 

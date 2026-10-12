@@ -125,6 +125,8 @@ class MergeResult:
     superseded: pd.DataFrame
     #: ``False`` si la partición quedaría idéntica (no hace falta reescribirla).
     changed: bool = True
+    #: Contratos aplicados (nuevos o actualizados) en esta fusión.
+    applied: int = 0
 
 
 def merge_versions(
@@ -159,6 +161,8 @@ def merge_versions(
     return MergeResult(
         rows=combined[winner].reset_index(drop=True),
         superseded=superseded.reset_index(drop=True),
+        # Con foto + diff sólo llega lo nuevo o cambiado: cuenta todo lo que llega.
+        applied=len(incoming),
     )
 
 
@@ -211,6 +215,7 @@ def _merge_groups(
         superseded=superseded.drop(columns="_origen").reset_index(drop=True),
         # Los contratos nuevos también están en ``replace`` (sin firma vieja).
         changed=bool(replace),
+        applied=len(replace),
     )
 
 
@@ -277,7 +282,7 @@ def _apply_merge(
     incoming: pd.DataFrame,
     detected_at: datetime | None,
     base: Base,
-) -> pd.DataFrame:
+) -> MergeResult:
     result = merge_versions(existing, incoming, base)
     # Historial ANTES que la partición: si la escritura de la partición falla,
     # la versión reemplazada ya está a salvo (y append es idempotente).
@@ -293,7 +298,24 @@ def _apply_merge(
         write_partition(store, partition, result.rows, base)
     else:
         logger.info("Partición %s/%s sin cambios", partition, base.data_file)
-    return result.rows
+    return result
+
+
+def upsert(
+    store: ObjectStore,
+    partition: str,
+    new_rows: pd.DataFrame,
+    *,
+    detected_at: datetime | None = None,
+    base: Base = CONTRATOS,
+) -> MergeResult:
+    """Fusiona ``new_rows`` con la partición existente (si la hay) y reescribe.
+
+    Nunca elimina contratos: los ids que no vienen en ``new_rows`` se conservan.
+    Si nada cambió, la partición no se reescribe (``result.changed`` es falso).
+    """
+    existing = read_partition(store, partition, base)
+    return _apply_merge(store, partition, existing, new_rows, detected_at, base)
 
 
 def upsert_partition(
@@ -304,13 +326,8 @@ def upsert_partition(
     detected_at: datetime | None = None,
     base: Base = CONTRATOS,
 ) -> pd.DataFrame:
-    """Fusiona ``new_rows`` con la partición existente (si la hay) y reescribe.
-
-    Nunca elimina contratos: los ids que no vienen en ``new_rows`` se conservan.
-    Devuelve el contenido escrito de la partición.
-    """
-    existing = read_partition(store, partition, base)
-    return _apply_merge(store, partition, existing, new_rows, detected_at, base)
+    """Como :func:`upsert`, pero devuelve sólo el contenido de la partición."""
+    return upsert(store, partition, new_rows, detected_at=detected_at, base=base).rows
 
 
 def write_new_partition(
@@ -322,7 +339,7 @@ def write_new_partition(
     base: Base = CONTRATOS,
 ) -> pd.DataFrame:
     """Escribe una partición desde cero (sólo tests/partición inexistente)."""
-    return _apply_merge(store, partition, None, rows, detected_at, base)
+    return _apply_merge(store, partition, None, rows, detected_at, base).rows
 
 
 def move_out_ids(

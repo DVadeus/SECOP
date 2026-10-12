@@ -163,13 +163,33 @@ def fetch_snapshot(
         base=base,
     ):
         frames.append(pd.DataFrame.from_records(page, columns=list(columns)))
-    after = source_version(session, base)
+    _ensure_not_reloaded(before, source_version(session, base))
+    return pd.concat(frames, ignore_index=True)
+
+
+def _ensure_not_reloaded(before: int | None, after: int | None) -> None:
     if before != after:
         raise SourceReloadedError(
             f"El origen se recargó durante la descarga ({before} -> {after}); "
             "vuelve a ejecutar."
         )
-    return pd.concat(frames, ignore_index=True)
+
+
+def fetch_all_checked(
+    *,
+    session: requests.Session | None = None,
+    page_size: int | None = None,
+    base: Base = CONTRATOS,
+) -> list[dict[str, Any]]:
+    """Descarga TODAS las filas completas de ``base`` (datasets pequeños).
+
+    Lanza :class:`SourceReloadedError` si el origen se recargó mientras tanto.
+    """
+    before = source_version(session, base)
+    records = fetch_data("1=1", session=session, page_size=page_size, base=base)
+    _ensure_not_reloaded(before, source_version(session, base))
+    logger.info("Descargadas %d filas de %s", len(records), base.name)
+    return records
 
 
 def _soql_in(column: str, values: Sequence[str]) -> str:

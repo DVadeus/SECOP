@@ -1,6 +1,18 @@
 # Incremental Strategy
 
-The ETL is incremental, but **not watermark-driven**.
+The ETL is incremental, but **not watermark-driven**. Each base has its strategy
+(`Base.strategy` in `secop/bases.py`):
+
+- `contratos` (`snapshot_diff`): light snapshot + id index, described below.
+- `interadministrativos` (`full_refresh`): ~87 k rows and no version column, so every
+  run downloads the whole dataset (`extract.fetch_all_checked`, `rowsUpdatedAt`
+  checked before and after) and merges it by content: the multiset of row hashes of
+  each contract decides whether it changed. Unchanged partitions are not rewritten; a
+  second run with no source changes writes nothing. `backfill` for this base ignores
+  years and does the same full refresh.
+
+The rules below (never delete, cross-partition rules, restart, repair) apply to both
+bases; in `interadministrativos` they act on the whole contract (all its rows).
 
 ---
 

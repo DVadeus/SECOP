@@ -22,13 +22,14 @@ layer only filters/aggregates and exports.
 
 ## Dataset
 
-Source:
+Sources (bases, see `datasetContract.md`):
 
-https://www.datos.gov.co/resource/jbjy-vk9h.json
+- `contratos`: https://www.datos.gov.co/resource/jbjy-vk9h.json — SECOP II contracts
+- `interadministrativos`: https://www.datos.gov.co/resource/s484-c9k3.json —
+  interadministrative agreements, SECOP I and II
 
-Dataset:
-
-SECOP II contracts
+The CLI selects the base with `--base` (default `contratos`). A combined view of both
+bases is designed in `columnMapping.md` for a later PR.
 
 ---
 

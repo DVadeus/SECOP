@@ -15,7 +15,7 @@ from datetime import UTC, datetime
 
 import pandas as pd
 
-from secop.config import DATA_FILE, HISTORY_PREFIX
+from secop.bases import CONTRATOS, Base
 from secop.storage.base import ObjectStore
 
 logger = logging.getLogger(__name__)
@@ -35,10 +35,10 @@ COL_YEAR = "year"
 _DEDUP_KEY = [COL_HASH, COL_YEAR, COL_MOTIVO]
 
 
-def history_key(detected_at: datetime) -> str:
-    """Clave del archivo de historial del día de ``detected_at``."""
+def history_key(detected_at: datetime, base: Base = CONTRATOS) -> str:
+    """Clave del archivo de historial de ``base`` del día de ``detected_at``."""
     day = detected_at.astimezone(UTC).date().isoformat()
-    return f"{HISTORY_PREFIX}/detectado={day}/{DATA_FILE}"
+    return f"{base.history_prefix}/detectado={day}/{base.data_file}"
 
 
 def content_hash(df: pd.DataFrame) -> pd.Series:
@@ -69,6 +69,7 @@ def append(
     partition: str,
     motivo: str,
     detected_at: datetime | None = None,
+    base: Base = CONTRATOS,
 ) -> int:
     """Anexa ``rows`` al historial del día. Devuelve cuántas filas nuevas quedaron.
 
@@ -84,7 +85,7 @@ def append(
     batch[COL_MOTIVO] = motivo
     batch[COL_DETECTADO] = pd.Timestamp(detected_at.astimezone(UTC)).tz_localize(None)
 
-    key = history_key(detected_at)
+    key = history_key(detected_at, base)
     existing = _read(store, key)
     before = 0 if existing is None else len(existing)
     combined = batch if existing is None else pd.concat([existing, batch])

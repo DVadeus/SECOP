@@ -4,15 +4,20 @@ Comandos:
 
 * ``secop etl backfill``     — carga histórica (local, reanudable)
 * ``secop etl incremental``  — actualización incremental (la usa GitHub Actions)
+* ``secop etl reparar``      — corrige datos escritos por versiones anteriores
 * ``secop query``            — consulta el lake por filtros y exporta a Excel/CSV
-* ``secop sql``              — ejecuta SQL DuckDB crudo contra la vista ``contratos``
+* ``secop sql``              — SQL DuckDB crudo sobre las vistas de todas las bases
 * ``secop historial``        — versiones reemplazadas de contratos, por NIT
 * ``secop info``             — estado del lake (particiones, filas, watermark)
+
+Los comandos de ETL y de consulta aceptan ``--base contratos|interadministrativos``
+(por defecto ``contratos``).
 """
 
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated
@@ -54,6 +59,15 @@ def _store(target: str):
     return get_store(target)
 
 
+def _base(name: str):
+    from secop.bases import get_base
+
+    try:
+        return get_base(name)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc), param_hint="--base") from exc
+
+
 @etl_app.command("backfill")
 def etl_backfill(
     start: Annotated[
@@ -69,8 +83,14 @@ def etl_backfill(
     force: Annotated[
         bool, typer.Option(help="Rehacer años que ya existan en el lake.")
     ] = False,
+    base: Annotated[
+        str, typer.Option(help="Base: 'contratos' o 'interadministrativos'.")
+    ] = "contratos",
 ) -> None:
-    """Carga histórica completa. Pensada para correr en local, una vez."""
+    """Carga histórica completa. Pensada para correr en local, una vez.
+
+    Una base que se baja completa (interadministrativos) ignora los años.
+    """
     from secop.pipeline import backfill
 
     result = backfill(
@@ -79,6 +99,7 @@ def etl_backfill(
         end_year=end,
         force=force,
         only_year=year,
+        base=_base(base),
     )
     _print_run_result(result)
 
@@ -86,11 +107,14 @@ def etl_backfill(
 @etl_app.command("incremental")
 def etl_incremental(
     target: Annotated[str, typer.Option(help="Destino: 'r2' o 'local'.")] = "r2",
+    base: Annotated[
+        str, typer.Option(help="Base: 'contratos' o 'interadministrativos'.")
+    ] = "contratos",
 ) -> None:
     """Compara el origen con el lake y descarga lo nuevo o cambiado. No borra nada."""
     from secop.pipeline import incremental
 
-    result = incremental(_store(target))
+    result = incremental(_store(target), _base(base))
     _print_run_result(result)
 
 
@@ -101,6 +125,9 @@ def etl_reparar(
         typer.Option(help="Aplicar los cambios (por defecto sólo se informa)."),
     ] = False,
     target: Annotated[str, typer.Option(help="Destino: 'r2' o 'local'.")] = "r2",
+    base: Annotated[
+        str, typer.Option(help="Base: 'contratos' o 'interadministrativos'.")
+    ] = "contratos",
 ) -> None:
     """Saca de year=unknown los contratos que ya están en un año real.
 
@@ -109,7 +136,7 @@ def etl_reparar(
     """
     from secop.pipeline import repair
 
-    report = repair(_store(target), apply=aplicar)
+    report = repair(_store(target), apply=aplicar, base=_base(base))
     console.print(
         f"Contratos en year=unknown que ya tienen año: "
         f"[bold]{report.unknown_with_date:,}[/bold]"
@@ -171,11 +198,16 @@ def query_cmd(
         str | None, typer.Option(help="Texto contenido en nombre_entidad.")
     ] = None,
     proveedor_contains: Annotated[
-        str | None, typer.Option(help="Texto contenido en proveedor_adjudicado.")
+        str | None,
+        typer.Option(help="Texto en proveedor_adjudicado (o 'contratista')."),
     ] = None,
     departamento: _OptList = None,
     estado: _OptList = None,
     modalidad: _OptList = None,
+    plataforma: Annotated[
+        list[str] | None,
+        typer.Option(help="SECOP_I o SECOP_II (sólo interadministrativos)."),
+    ] = None,
     year_from: Annotated[int | None, typer.Option(help="Año de inicio desde.")] = None,
     year_to: Annotated[int | None, typer.Option(help="Año de inicio hasta.")] = None,
     valor_min: Annotated[
@@ -193,8 +225,11 @@ def query_cmd(
         Path | None,
         typer.Option(help="Directorio Parquet a consultar (con --source local)."),
     ] = None,
+    base: Annotated[
+        str, typer.Option(help="Base: 'contratos' o 'interadministrativos'.")
+    ] = "contratos",
 ) -> None:
-    """Filtra el lake por características y exporta el resultado."""
+    """Filtra una base del lake por características y exporta el resultado."""
     from secop.query import QueryEngine, export_dataframe
     from secop.query.filters import QuerySpec, build_query
 
@@ -206,6 +241,7 @@ def query_cmd(
         departamento=list(departamento or []),
         estado=list(estado or []),
         modalidad=list(modalidad or []),
+        plataforma=list(plataforma or []),
         year_from=year_from,
         year_to=year_to,
         valor_min=valor_min,
@@ -213,10 +249,20 @@ def query_cmd(
         columns=[c.strip() for c in columns.split(",")] if columns else [],
         limit=limit,
     )
-    sql, params = build_query(spec)
+    chosen = _base(base)
+    sql, params = _build(build_query, spec, chosen)
     logger.debug("SQL generado:\n%s", sql)
+    if spec.nit_entidad and chosen.column_map:
+        console.print(
+            "[yellow]--nit-entidad en interadministrativos se resuelve con el "
+            "código de entidad de la base de contratos: sólo encuentra convenios "
+            "de SECOP II. Para SECOP I usa --entidad-contains.[/yellow]"
+        )
 
     with QueryEngine.from_source(source, path=path) as engine:
+        _require(engine, chosen.name)
+        if spec.nit_entidad and chosen.column_map:
+            _require(engine, "contratos")  # el NIT se resuelve con contratos
         df = engine.run(sql, params)
 
     if df.empty:
@@ -227,9 +273,38 @@ def query_cmd(
     console.print(f"[green]{len(df):,} filas[/green] -> {written}")
 
 
+def _build(
+    builder: Callable[..., tuple[str, list[object]]], *args: object
+) -> tuple[str, list[object]]:
+    """Ejecuta ``builder`` mostrando los filtros no soportados como error de uso."""
+    from secop.query.filters import UnsupportedFilterError
+
+    try:
+        return builder(*args)
+    except UnsupportedFilterError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+
+def _require(engine: object, view: str) -> None:
+    from secop.query import QueryEngine
+
+    assert isinstance(engine, QueryEngine)
+    try:
+        engine.require_view(view)
+    except LookupError as exc:
+        console.print(f"[yellow]{exc}.[/yellow]")
+        raise typer.Exit(code=1) from exc
+
+
 @app.command("sql")
 def sql_cmd(
-    query: Annotated[str, typer.Argument(help="SQL DuckDB. La vista es 'contratos'.")],
+    query: Annotated[
+        str,
+        typer.Argument(
+            help="SQL DuckDB. Vistas: contratos, interadministrativos y sus "
+            "*_historial."
+        ),
+    ],
     output: Annotated[
         Path | None,
         typer.Option("--output", "-o", help="Si se indica, exporta el resultado."),
@@ -242,7 +317,7 @@ def sql_cmd(
         int, typer.Option(help="Filas a mostrar en consola si no hay --output.")
     ] = 50,
 ) -> None:
-    """Ejecuta SQL crudo contra la vista ``contratos``."""
+    """Ejecuta SQL crudo sobre las vistas del lake (todas las bases)."""
     from secop.query import QueryEngine, export_dataframe
 
     with QueryEngine.from_source(source, path=path) as engine:
@@ -280,6 +355,9 @@ def historial_cmd(
     path: Annotated[
         Path | None, typer.Option(help="Directorio Parquet (con --source local).")
     ] = None,
+    base: Annotated[
+        str, typer.Option(help="Base: 'contratos' o 'interadministrativos'.")
+    ] = "contratos",
 ) -> None:
     """Exporta las versiones anteriores (reemplazadas) de los contratos de un NIT.
 
@@ -289,17 +367,20 @@ def historial_cmd(
     from secop.query import QueryEngine, export_dataframe
     from secop.query.filters import build_history_query
 
+    chosen = _base(base)
     try:
         sql, params = build_history_query(
-            list(nit_proveedor or []), list(nit_entidad or [])
+            list(nit_proveedor or []), list(nit_entidad or []), chosen
         )
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
 
     with QueryEngine.from_source(source, path=path) as engine:
-        if not engine.has_history:
+        if not engine.has_view(chosen.history_view):
             console.print("[yellow]Aún no hay historial de versiones.[/yellow]")
             raise typer.Exit(code=1)
+        if nit_entidad and chosen.column_map:
+            _require(engine, "contratos")  # el NIT se resuelve con contratos
         df = engine.run(sql, params)
 
     if df.empty:
@@ -331,36 +412,43 @@ def info_cmd(
     path: Annotated[
         Path | None, typer.Option(help="Directorio Parquet (con --source local).")
     ] = None,
+    base: Annotated[
+        str, typer.Option(help="Base: 'contratos' o 'interadministrativos'.")
+    ] = "contratos",
 ) -> None:
-    """Muestra el estado del lake: particiones, filas, rango de fechas, watermark."""
+    """Muestra el estado de una base: particiones, filas, fechas, watermark."""
     from secop.query import QueryEngine
 
+    chosen = _base(base)
     with QueryEngine.from_source(source, path=path) as engine:
-        summary = engine.partition_summary()
+        _require(engine, chosen.name)
+        summary = engine.partition_summary(chosen)
         total = int(summary["filas"].sum()) if not summary.empty else 0
-        lo, hi = engine.date_range()
-        glob = engine.glob
+        lo, hi = engine.date_range(chosen)
+        glob = engine.globs[chosen.name]
 
-    table = Table(title=f"Lake SECOP ({source})")
+    table = Table(title=f"Lake SECOP: {chosen.name} ({source})")
     table.add_column("year")
     table.add_column("filas", justify="right")
     for _, r in summary.iterrows():
         table.add_row(str(r["year"]), f"{int(r['filas']):,}")
     table.add_row("[bold]TOTAL[/bold]", f"[bold]{total:,}[/bold]")
     console.print(table)
-    console.print(f"Rango fecha_de_inicio_del_contrato: {lo} -> {hi}")
+    console.print(f"Rango {chosen.partition_date_column}: {lo} -> {hi}")
     console.print(f"Glob: {glob}")
 
     if source == "r2":
-        _print_state()
+        _print_state(chosen)
 
 
-def _print_state() -> None:
+def _print_state(base: object) -> None:
+    from secop.bases import Base
     from secop.state import load_state
     from secop.storage import get_store
 
+    assert isinstance(base, Base)
     try:
-        state = load_state(get_store("r2"))
+        state = load_state(get_store("r2"), base)
     except Exception as exc:  # noqa: BLE001 - sólo informativo
         console.print(f"[yellow]No se pudo leer el estado: {exc}[/yellow]")
         return

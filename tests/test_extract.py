@@ -131,3 +131,30 @@ def test_fetch_by_ids_batches_and_escapes_quotes() -> None:
     assert [r["id_contrato"] for r in rows] == ["A", "O'B"]
     assert session.calls[0]["$where"] == "id_contrato in ('A')"
     assert session.calls[1]["$where"] == "id_contrato in ('O''B')"
+
+
+def test_fetch_all_checked_uses_base_url_and_detects_reload() -> None:
+    from secop.bases import INTERADMINISTRATIVOS
+
+    class _UrlSession(_RoutingSession):
+        def __init__(self, versions: list[int], pages: list[list[dict[str, Any]]]):
+            super().__init__(versions, pages)
+            self.urls: list[str] = []
+
+        def get(self, url: str, headers=None, params=None, timeout=None) -> Any:  # noqa: ANN001
+            self.urls.append(url)
+            return super().get(url, headers=headers, params=params, timeout=timeout)
+
+    ok = _UrlSession(versions=[5, 5], pages=[[{"id_contrato": "A"}]])
+    rows = extract.fetch_all_checked(
+        session=ok, page_size=10, base=INTERADMINISTRATIVOS
+    )  # type: ignore[arg-type]
+    assert rows == [{"id_contrato": "A"}]
+    assert any("s484-c9k3" in u for u in ok.urls)
+    assert all("jbjy-vk9h" not in u for u in ok.urls)
+
+    reloaded = _UrlSession(versions=[5, 6], pages=[[{"id_contrato": "A"}]])
+    with pytest.raises(extract.SourceReloadedError):
+        extract.fetch_all_checked(
+            session=reloaded, page_size=10, base=INTERADMINISTRATIVOS
+        )  # type: ignore[arg-type]

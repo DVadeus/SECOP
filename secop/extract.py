@@ -14,12 +14,8 @@ from typing import Any
 import pandas as pd
 import requests
 
-from secop.config import (
-    PRIMARY_KEY,
-    SOCRATA_METADATA_URL,
-    SOCRATA_RESOURCE_URL,
-    get_settings,
-)
+from secop.bases import CONTRATOS, Base
+from secop.config import get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +65,7 @@ def iter_pages(
     session: requests.Session | None = None,
     page_size: int | None = None,
     select: str | None = None,
+    base: Base = CONTRATOS,
 ) -> Iterator[list[dict[str, Any]]]:
     """Itera páginas de registros crudos para una cláusula ``$where`` dada.
 
@@ -89,7 +86,7 @@ def iter_pages(
             }
             if select:
                 params["$select"] = select
-            page = _request_with_retry(SOCRATA_RESOURCE_URL, params, session).json()
+            page = _request_with_retry(base.resource_url, params, session).json()
             if not page:
                 break
             downloaded += len(page)
@@ -108,10 +105,13 @@ def fetch_data(
     *,
     session: requests.Session | None = None,
     page_size: int | None = None,
+    base: Base = CONTRATOS,
 ) -> list[dict[str, Any]]:
     """Descarga todos los registros que cumplen ``where_clause`` (materializado)."""
     records: list[dict[str, Any]] = []
-    for page in iter_pages(where_clause, session=session, page_size=page_size):
+    for page in iter_pages(
+        where_clause, session=session, page_size=page_size, base=base
+    ):
         records.extend(page)
     return records
 
@@ -123,7 +123,9 @@ class SourceReloadedError(RuntimeError):
     """El origen se recargó durante una descarga paginada (páginas inconsistentes)."""
 
 
-def source_version(session: requests.Session | None = None) -> int | None:
+def source_version(
+    session: requests.Session | None = None, base: Base = CONTRATOS
+) -> int | None:
     """Marca de recarga del dataset (``rowsUpdatedAt`` de la API de metadatos).
 
     datos.gov.co recarga el dataset completo a diario y ``:id`` cambia: si la
@@ -132,7 +134,7 @@ def source_version(session: requests.Session | None = None) -> int | None:
     owns_session = session is None
     session = session or requests.Session()
     try:
-        meta = _request_with_retry(SOCRATA_METADATA_URL, {}, session).json()
+        meta = _request_with_retry(base.metadata_url, {}, session).json()
     finally:
         if owns_session:
             session.close()
@@ -145,24 +147,49 @@ def fetch_snapshot(
     *,
     session: requests.Session | None = None,
     page_size: int | None = None,
+    base: Base = CONTRATOS,
 ) -> pd.DataFrame:
     """Descarga ``columns`` de TODO el dataset (sin filas completas).
 
     Lanza :class:`SourceReloadedError` si el origen se recargó mientras tanto.
     """
-    before = source_version(session)
+    before = source_version(session, base)
     frames = [pd.DataFrame(columns=list(columns))]
     for page in iter_pages(
-        "1=1", session=session, page_size=page_size, select=", ".join(columns)
+        "1=1",
+        session=session,
+        page_size=page_size,
+        select=", ".join(columns),
+        base=base,
     ):
         frames.append(pd.DataFrame.from_records(page, columns=list(columns)))
-    after = source_version(session)
+    _ensure_not_reloaded(before, source_version(session, base))
+    return pd.concat(frames, ignore_index=True)
+
+
+def _ensure_not_reloaded(before: int | None, after: int | None) -> None:
     if before != after:
         raise SourceReloadedError(
             f"El origen se recargó durante la descarga ({before} -> {after}); "
             "vuelve a ejecutar."
         )
-    return pd.concat(frames, ignore_index=True)
+
+
+def fetch_all_checked(
+    *,
+    session: requests.Session | None = None,
+    page_size: int | None = None,
+    base: Base = CONTRATOS,
+) -> list[dict[str, Any]]:
+    """Descarga TODAS las filas completas de ``base`` (datasets pequeños).
+
+    Lanza :class:`SourceReloadedError` si el origen se recargó mientras tanto.
+    """
+    before = source_version(session, base)
+    records = fetch_data("1=1", session=session, page_size=page_size, base=base)
+    _ensure_not_reloaded(before, source_version(session, base))
+    logger.info("Descargadas %d filas de %s", len(records), base.name)
+    return records
 
 
 def _soql_in(column: str, values: Sequence[str]) -> str:
@@ -175,6 +202,7 @@ def fetch_by_ids(
     *,
     session: requests.Session | None = None,
     batch_size: int = ID_BATCH_SIZE,
+    base: Base = CONTRATOS,
 ) -> list[dict[str, Any]]:
     """Descarga las filas completas de ``ids`` en lotes de ``batch_size``."""
     owns_session = session is None
@@ -183,7 +211,8 @@ def fetch_by_ids(
     try:
         for start in range(0, len(ids), batch_size):
             chunk = ids[start : start + batch_size]
-            records.extend(fetch_data(_soql_in(PRIMARY_KEY, chunk), session=session))
+            where = _soql_in(base.key, chunk)
+            records.extend(fetch_data(where, session=session, base=base))
     finally:
         if owns_session:
             session.close()

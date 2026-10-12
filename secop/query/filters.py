@@ -15,8 +15,12 @@ from dataclasses import dataclass, field
 
 from secop.bases import CONTRATOS, Base
 from secop.lake import UNKNOWN_YEAR
+from secop.query.combined import COL_BASE_ORIGEN, COL_ES_INTER, CombinedView
 
 _IDENTIFIER = re.compile(r"^[a-z_][a-z0-9_]*$")
+
+#: Destino de una consulta: una base o la vista combinada (``--base todas``).
+Target = Base | CombinedView
 
 
 class InvalidColumnError(ValueError):
@@ -39,6 +43,8 @@ class QuerySpec:
     estado: list[str] = field(default_factory=list)
     modalidad: list[str] = field(default_factory=list)
     plataforma: list[str] = field(default_factory=list)
+    #: Sólo contratos interadministrativos (``es_interadministrativo``; ``todas``).
+    solo_interadministrativos: bool = False
     year_from: int | None = None
     year_to: int | None = None
     valor_min: float | None = None
@@ -53,7 +59,7 @@ class QuerySpec:
         return list(self.columns)
 
 
-def column_for(base: Base, contratos_column: str, option: str) -> str:
+def column_for(base: Target, contratos_column: str, option: str) -> str:
     """Columna de ``base`` equivalente a ``contratos_column`` de contratos."""
     if not base.column_map:
         return contratos_column
@@ -75,26 +81,40 @@ def _in_clause_ci(column: str, values: list[str], params: list[object]) -> str:
     return f"lower({column}) IN ({placeholders})"
 
 
-def _nit_entidad_clause(base: Base, nits: list[str], params: list[object]) -> str:
+def _codigo_de_nit(nits: list[str], params: list[object]) -> str:
+    """Subconsulta: códigos de entidad de contratos con esos NIT (relación 1:1)."""
+    inner = _in_clause("nit_entidad", nits, params)
+    return (
+        f"SELECT DISTINCT CAST(codigo_entidad AS VARCHAR) "
+        f"FROM {CONTRATOS.name} WHERE {inner}"
+    )
+
+
+def _nit_entidad_clause(base: Target, nits: list[str], params: list[object]) -> str:
     """Filtro por NIT de entidad, también en bases que no lo tienen.
 
     En interadministrativos no hay NIT de entidad, pero ``id_entidad`` es el
     ``codigo_entidad`` de contratos (100 % en SECOP II): se resuelve con la
     vista ``contratos``. Las entidades de SECOP I no tienen esa equivalencia.
+    En la vista combinada, las filas de contratos usan su ``nit_entidad`` y las
+    de interadministrativos, la misma equivalencia por ``codigo_entidad``.
     """
+    if isinstance(base, CombinedView):
+        direct = _in_clause("nit_entidad", nits, params)
+        lookup = _codigo_de_nit(nits, params)
+        return (
+            f"({direct} OR ({COL_BASE_ORIGEN} = 'interadministrativos' "
+            f"AND codigo_entidad IN ({lookup})))"
+        )
     if not base.column_map or "nit_entidad" in base.column_map.values():
         return _in_clause(
             column_for(base, "nit_entidad", "--nit-entidad"), nits, params
         )
     own = column_for(base, "codigo_entidad", "--nit-entidad")
-    inner = _in_clause("nit_entidad", nits, params)
-    return (
-        f"{own} IN (SELECT DISTINCT CAST(codigo_entidad AS VARCHAR) "
-        f"FROM {CONTRATOS.name} WHERE {inner})"
-    )
+    return f"{own} IN ({_codigo_de_nit(nits, params)})"
 
 
-def _text_filters(spec: QuerySpec, base: Base, params: list[object]) -> list[str]:
+def _text_filters(spec: QuerySpec, base: Target, params: list[object]) -> list[str]:
     where: list[str] = []
     if spec.nit_proveedor:
         col = column_for(base, "documento_proveedor", "--nit-proveedor")
@@ -125,10 +145,17 @@ def _text_filters(spec: QuerySpec, base: Base, params: list[object]) -> list[str
                 f"--plataforma no está disponible en {base.name}"
             )
         where.append(_in_clause_ci(base.platform_column, spec.plataforma, params))
+    if spec.solo_interadministrativos:
+        if not isinstance(base, CombinedView):
+            raise UnsupportedFilterError(
+                "--solo-interadministrativos sólo aplica con --base todas "
+                "(en interadministrativos todos lo son)"
+            )
+        where.append(COL_ES_INTER)
     return where
 
 
-def _range_filters(spec: QuerySpec, base: Base, params: list[object]) -> list[str]:
+def _range_filters(spec: QuerySpec, base: Target, params: list[object]) -> list[str]:
     where: list[str] = []
     # "year=unknown" (fecha de inicio nula o fuera de rango) siempre pasa el
     # filtro de año: si no se conoce el año no se puede afirmar que esté fuera
@@ -152,8 +179,12 @@ def _range_filters(spec: QuerySpec, base: Base, params: list[object]) -> list[st
     return where
 
 
-def build_query(spec: QuerySpec, base: Base = CONTRATOS) -> tuple[str, list[object]]:
-    """Devuelve ``(sql, params)`` para el ``QuerySpec`` dado sobre ``base``."""
+def build_query(spec: QuerySpec, base: Target = CONTRATOS) -> tuple[str, list[object]]:
+    """Devuelve ``(sql, params)`` para el ``QuerySpec`` dado sobre ``base``.
+
+    ``base`` puede ser la vista combinada (``secop.query.combined.TODAS``), que ya
+    usa los nombres de columna de contratos.
+    """
     cols = spec.validated_columns()
     select = ", ".join(cols) if cols else "*"
 

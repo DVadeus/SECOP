@@ -169,7 +169,11 @@ def _print_run_result(result: object) -> None:
         "Contratos escritos (nuevos o actualizados): "
         f"[bold]{result.contracts_written:,}[/bold]"
     )
-    console.print(f"Watermark: [bold]{result.new_watermark}[/bold]")
+    console.print(f"Watermark: [bold]{_watermark_text(result.new_watermark)}[/bold]")
+
+
+def _watermark_text(value: str | None) -> str:
+    return value or "no aplica (la base no tiene columna de versión)"
 
 
 # --------------------------------------------------------------------------- #
@@ -452,8 +456,12 @@ def _print_state(base: object) -> None:
     except Exception as exc:  # noqa: BLE001 - sólo informativo
         console.print(f"[yellow]No se pudo leer el estado: {exc}[/yellow]")
         return
+    # Una base sin columna de versión no tiene watermark (aunque un estado viejo
+    # guarde el valor por defecto).
+    watermark = state.ultima_actualizacion if base.version_column else None
     console.print(
-        f"Watermark (ultima_actualizacion): [bold]{state.ultima_actualizacion}[/bold]"
+        f"Watermark ({base.version_column or 'sin columna de versión'}): "
+        f"[bold]{_watermark_text(watermark)}[/bold]"
     )
     console.print(f"Última corrida: {state.last_run_utc}")
     console.print(f"Versión de esquema: {state.schema_version}")
